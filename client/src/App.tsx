@@ -489,6 +489,16 @@ function formToData(f: FormState, existing?: Profile) {
       portrayal_focus: f.portrayalFocus.trim()
         ? f.portrayalFocus.trim()
         : null,
+      // CR-21: the portrayal check state is generation-managed (like
+      // the video fields below) — carried through from the stored
+      // profile untouched; the server resets it when the focus value
+      // itself changes.
+      portrayal_focus_status:
+        existing?.background.portrayal_focus_status ?? "unknown",
+      portrayal_focus_failure_reason:
+        existing?.background.portrayal_focus_failure_reason ?? null,
+      portrayal_focus_checks: existing?.background
+        .portrayal_focus_checks ?? { link_summary: null, video_transcript: null },
       // CR-17: reference video URLs are user input; the transcript
       // findings (video_notes / unreadable_videos / processed marks)
       // are generation-managed and carried through from the stored
@@ -848,6 +858,35 @@ function PendingApplyBadge({ profile }: { profile: Profile }) {
       ⏳ 反映待ち（{parts.join("・")}）
     </span>
   );
+}
+
+// CR-21: shown while the profile's 「演じる姿・状況」 specification
+// could not be honored by its source material (portrayal check state
+// "failed"). The bias is inactive then — the profile is built and acted
+// from all material as usual — and this badge is how the user learns
+// the specification did not take effect. Warning color matches the
+// other failure indicators (preparation 要対応 uses the same accent).
+function PortrayalFailedBadge({ profile }: { profile: Profile }) {
+  if (profile.background.portrayal_focus_status !== "failed") return null;
+  return (
+    <span
+      className="inline-block rounded-full px-2 py-0.5 text-xs font-bold whitespace-nowrap text-white"
+      style={{ background: "var(--accent)" }}
+      aria-label="状況指定失敗（指定した姿・状況に当たる資料がありませんでした。バイアスは無効になっています）"
+    >
+      ⚠ 状況指定失敗
+    </span>
+  );
+}
+
+// CR-21: which source kinds the portrayal verdict was based on, for
+// the detail screen ("判定に使った資料").
+function portrayalCheckedLabels(profile: Profile): string[] {
+  const checks = profile.background.portrayal_focus_checks;
+  const labels: string[] = [];
+  if (checks?.link_summary) labels.push("参考リンク");
+  if (checks?.video_transcript) labels.push("参考動画");
+  return labels;
 }
 
 function PreparationChecklist({ profile }: { profile: Profile }) {
@@ -1693,7 +1732,7 @@ function ProfileFormFields({
           </div>
           <div>
             <label htmlFor="f-portrayal-focus" className="text-sm font-semibold">演じる姿・状況（任意）</label>
-            <p className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>指定すると、その姿・状況に当たる資料を中心にプロファイルを作ります。空欄の場合は通常どおり全体から作ります。切り替えや試し会話でも、その姿・状況で応答する前提として渡されます。該当する資料が無い場合は、他の時期・状態で補わず、その旨が書き戻しで伝えられます。</p>
+            <p className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>指定すると、その姿・状況に当たる資料を中心にプロファイルを作ります。空欄の場合は通常どおり全体から作ります。切り替えや試し会話でも、その姿・状況で応答する前提として渡されます。資料に該当する部分が無い場合は、指定を無視して全体から通常どおり作り、プロファイルに「状況指定失敗」と理由が表示されます（資料を追加・変更して当たる資料が見つかれば、指定は自動で再び有効になります）。</p>
             <textarea id="f-portrayal-focus" className={`${inputCls} mt-1.5`} style={inputStyle} rows={2} value={form.portrayalFocus} maxLength={2000} placeholder="例: 中学生の時のみ／闇落ちした状態／もしも〜だったら（if設定）など、寄せたい姿・状況を書けます" onChange={(e) => set({ portrayalFocus: e.target.value })} />
           </div>
         </fieldset>
@@ -2104,6 +2143,9 @@ function ProfileCard({
               <span className="shrink-0">
                 <PendingApplyBadge profile={profile} />
               </span>
+              <span className="shrink-0">
+                <PortrayalFailedBadge profile={profile} />
+              </span>
             </div>
             <p
               className="mt-1 line-clamp-2 h-10 text-sm leading-5 break-words"
@@ -2389,6 +2431,7 @@ function FocusView({
               )}
               <PreparationBadge profile={profile} showDetail />
               <PendingApplyBadge profile={profile} />
+              <PortrayalFailedBadge profile={profile} />
               <button
                 type="button"
                 aria-label={profile.favorite ? `${profile.name}のピン留めを外す` : `${profile.name}をピン留めする`}
@@ -3772,6 +3815,7 @@ function DetailView({
         )}
         <PreparationBadge profile={profile} showDetail />
         <PendingApplyBadge profile={profile} />
+        <PortrayalFailedBadge profile={profile} />
       </div>
 
       {(profile.pending_apply_count > 0 || profile.pending_switch_count > 0) && (
@@ -3853,7 +3897,32 @@ function DetailView({
             )}
             <p className="mt-3 text-sm font-semibold">演じる姿・状況</p>
             {profile.background.portrayal_focus ? (
-              <p className="mt-1 rounded-lg p-3 text-sm whitespace-pre-wrap" style={{ background: "var(--surface-alt)", border: "1.5px solid var(--gold)" }}>{profile.background.portrayal_focus}</p>
+              <>
+                <p className="mt-1 rounded-lg p-3 text-sm whitespace-pre-wrap" style={{ background: "var(--surface-alt)", border: "1.5px solid var(--gold)" }}>{profile.background.portrayal_focus}</p>
+                {profile.background.portrayal_focus_status === "failed" && (
+                  <div className="mt-2 rounded-lg p-3 text-sm" style={{ background: "var(--surface-alt)", border: "1.5px solid var(--accent)" }} role="status">
+                    <PortrayalFailedBadge profile={profile} />
+                    <p className="mt-2">
+                      理由: {profile.background.portrayal_focus_failure_reason ?? "指定の姿・状況に当たる資料がありませんでした"}
+                    </p>
+                    {portrayalCheckedLabels(profile).length > 0 && (
+                      <p className="mt-1" style={{ color: "var(--dim)" }}>
+                        判定に使った資料: {portrayalCheckedLabels(profile).join("・")}
+                      </p>
+                    )}
+                    <p className="mt-1" style={{ color: "var(--dim)" }}>
+                      この指定は現在バイアスとして効いておらず、プロファイルは資料全体から通常どおり作られ、全体の姿で応答します（プロファイル自体は利用できます）。資料を追加・変更して再判定で当たる資料が見つかれば、指定は自動で再び有効になります。
+                    </p>
+                  </div>
+                )}
+                {profile.background.portrayal_focus_status === "ok" && (
+                  <p className="mt-1 text-sm" style={{ color: "var(--teal)" }}>
+                    ✓ 指定に当たる資料が見つかっています（バイアス有効
+                    {portrayalCheckedLabels(profile).length > 0 && `／判定に使った資料: ${portrayalCheckedLabels(profile).join("・")}`}
+                    ）
+                  </p>
+                )}
+              </>
             ) : (
               <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>未指定（バイアスなし。通常どおり全体から作られ、全体の姿で応答します）</p>
             )}

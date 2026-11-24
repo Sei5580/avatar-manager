@@ -316,6 +316,36 @@ const profileDataSchema = z.object({
     // that portrayal/situation. Legacy profiles parse with null, so
     // existing profiles gain the field empty and nothing else changes.
     portrayal_focus: z.string().max(2000).nullable().default(null),
+    // CR-21: the outcome of checking whether the CURRENT portrayal_focus
+    // can actually be honored by the source material. "unknown" = not
+    // judged yet (no completed link_summary / video_transcript check for
+    // the current value); "ok" = at least one completed check found
+    // matching material (bias effective); "failed" = every completed
+    // check reported no matching material and none found any — the bias
+    // is then treated as INACTIVE (payloads carry no portrayal keys,
+    // exactly like an unused field) while the profile itself stays
+    // fully usable and its preparation status is unaffected. The check
+    // state is generation-managed: user edits never set it directly,
+    // and changing / clearing portrayal_focus resets it to "unknown"
+    // (CR-20's re-queue re-judges it). Legacy profiles parse with
+    // "unknown" / null / empty checks, so nothing changes for them.
+    portrayal_focus_status: z
+      .enum(["unknown", "ok", "failed"])
+      .default("unknown"),
+    portrayal_focus_failure_reason: z
+      .string()
+      .max(1000)
+      .nullable()
+      .default(null),
+    portrayal_focus_checks: z
+      .object({
+        link_summary: z.enum(["match", "no_match"]).nullable().default(null),
+        video_transcript: z
+          .enum(["match", "no_match"])
+          .nullable()
+          .default(null),
+      })
+      .default({ link_summary: null, video_transcript: null }),
     // CR-17: 参考動画URL — video URLs (YouTube etc.) kept SEPARATE from
     // `links`: a video is not read as a web page; the chat side fetches
     // its transcript (字幕/文字起こし) and mines the dialogue for tone
@@ -561,16 +591,23 @@ function portrayalFocusValue(data: ProfileData): string | null {
 
 // Bias instruction for material-based generation (link_summary /
 // flavor_examples): use only the parts of the sources that match the
-// specified portrayal/situation, and never fill a gap from other
-// periods/states — report the absence instead.
+// specified portrayal/situation. CR-21: when NOTHING in the sources
+// matches, do NOT let the summary/tone collapse into a "no material"
+// text — ignore the bias, build from ALL the material as usual, and
+// report the miss in the write-back (portrayal_focus_no_match: true
+// plus portrayal_focus_no_match_reason) so the app can mark the
+// specification as failed and show the reason.
 function portrayalGenerationNote(pf: string): string {
-  return `portrayal_focus（演じる姿・状況）として「${pf}」が指定されています。資料のうち、この姿・状況に当たる部分だけを材料にしてください。他の時期・状態の内容で勝手に補わないでください。該当する部分が資料に無い場合は、その旨を書き戻しで伝えてください（result に portrayal_focus_no_match: true を含めるか、要約・メモに「指定の姿・状況（${pf}）に当たる資料はありませんでした」と明記してください）。`;
+  return `portrayal_focus（演じる姿・状況）として「${pf}」が指定されています。資料のうち、この姿・状況に当たる部分だけを材料にしてください。他の時期・状態の内容で勝手に補わないでください。指定の姿・状況に当たる資料が無い場合は、バイアス指定を無視して資料全体から通常どおり要約・口調を作ってください（要約や口調を「該当資料はありませんでした」という文面そのものに置き換えないでください）。そのうえで、result に portrayal_focus_no_match: true と portrayal_focus_no_match_reason（例: 参考リンクに指定の姿・状況の記述がない、といった理由文）を必ず含めてください。当たる資料が見つかった場合は portrayal_focus_no_match を含めないでください。`;
 }
 
 // Bias instruction for video_transcript: same filtering rule, plus the
-// chapter/segment selection the video case needs.
+// chapter/segment selection the video case needs. CR-21: the same
+// fall-back contract as portrayalGenerationNote — no matching segment
+// means build from the whole transcript as usual and report the miss
+// with a reason, never replace video_notes with a "no material" text.
 function portrayalVideoNote(pf: string): string {
-  return `portrayal_focus（演じる姿・状況）として「${pf}」が指定されています。各動画の文字起こしのうち、この姿・状況に当たるチャプター・区間だけを選んで材料にしてください。他の時期・状態の台詞で勝手に補わないでください。該当するチャプター・区間が無い場合は、その旨を書き戻しで伝えてください（result に portrayal_focus_no_match: true を含めるか、video_notes に「指定の姿・状況（${pf}）に当たる区間はありませんでした」と明記してください）。`;
+  return `portrayal_focus（演じる姿・状況）として「${pf}」が指定されています。各動画の文字起こしのうち、この姿・状況に当たるチャプター・区間だけを選んで材料にしてください。他の時期・状態の台詞で勝手に補わないでください。指定の姿・状況に当たるチャプター・区間が無い場合は、バイアス指定を無視して文字起こし全体から通常どおり口調の材料を作ってください（video_notes を「該当区間はありませんでした」という文面そのものに置き換えないでください）。そのうえで、result に portrayal_focus_no_match: true と portrayal_focus_no_match_reason（例: 参考動画に指定の姿・状況の場面がない、といった理由文）を必ず含めてください。当たる区間が見つかった場合は portrayal_focus_no_match を含めないでください。`;
 }
 
 // Bias instruction for image_generation: depict that portrayal/situation.
@@ -584,12 +621,36 @@ function portrayalActingNote(pf: string): string {
   return `portrayal_focus（演じる姿・状況）として「${pf}」が指定されています。演じる際の前提として、その姿・状況で応答してください（口調・言葉遣い・態度・知識・振る舞いは、その姿・状況に合わせてください）。`;
 }
 
+// CR-21: is the bias currently EFFECTIVE? The field must be set AND
+// its check state must not be "failed". While failed, the bias is
+// treated as inactive everywhere: generation / switch / profile_apply
+// / trial payloads carry no portrayal keys and no bias instruction —
+// byte-for-byte the payload of a profile that never used the field —
+// so content is built from all material as usual. The stored
+// portrayal_focus value itself is kept (the user can see what they
+// specified, and a later re-check that finds matching material flips
+// the state back to "ok" and re-activates the bias).
+function portrayalBiasActive(data: ProfileData): boolean {
+  return (
+    portrayalFocusValue(data) !== null &&
+    data.background.portrayal_focus_status !== "failed"
+  );
+}
+
+// The portrayal value to hand over in payloads / switch output: the
+// stored value while the bias is effective, null while it is failed
+// (or unused) — null means "no bias" to the chat side.
+function portrayalEffectiveValue(data: ProfileData): string | null {
+  return portrayalBiasActive(data) ? portrayalFocusValue(data) : null;
+}
+
 // Payload fields for material-based generation kinds. Empty object when
-// the field is unused, so spreading it leaves the payload untouched.
+// the field is unused OR its bias failed (CR-21), so spreading it
+// leaves the payload untouched.
 function portrayalGenerationFields(
   data: ProfileData,
 ): Record<string, string> {
-  const pf = portrayalFocusValue(data);
+  const pf = portrayalEffectiveValue(data);
   if (!pf) return {};
   return {
     portrayal_focus: pf,
@@ -600,15 +661,143 @@ function portrayalGenerationFields(
 
 // Payload fields for acting kinds (profile_apply; switch output uses
 // the same value/note pair through its typed schema). Empty object when
-// the field is unused.
+// the field is unused OR its bias failed (CR-21).
 function portrayalActingFields(data: ProfileData): Record<string, string> {
-  const pf = portrayalFocusValue(data);
+  const pf = portrayalEffectiveValue(data);
   if (!pf) return {};
   return {
     portrayal_focus: pf,
     background_portrayal_focus: pf,
     portrayal_focus_note: portrayalActingNote(pf),
   };
+}
+
+// CR-21: record the outcome of one completed portrayal check
+// (link_summary / video_transcript write-back) against the CURRENT
+// portrayal_focus value, and re-derive the status:
+//   - any completed check found matching material → "ok" (bias on),
+//     failure reason cleared;
+//   - at least one check completed and ALL of them reported no match
+//     → "failed", with the latest no-match reason kept for display;
+//   - no check completed yet → "unknown".
+// A check only counts while a focus is actually set; write-backs for
+// focus-less profiles never touch the state. This never touches the
+// preparation state — a failed bias is NOT a preparation failure and
+// the profile stays ready/usable.
+function recordPortrayalCheck(
+  data: ProfileData,
+  kind: "link_summary" | "video_transcript",
+  result: "match" | "no_match",
+  reason: string | null,
+): void {
+  if (!portrayalFocusValue(data)) return;
+  const checks = {
+    ...data.background.portrayal_focus_checks,
+    [kind]: result,
+  };
+  const outcomes = [checks.link_summary, checks.video_transcript].filter(
+    (v): v is "match" | "no_match" => v !== null,
+  );
+  let status: "unknown" | "ok" | "failed" =
+    data.background.portrayal_focus_status;
+  let failureReason = data.background.portrayal_focus_failure_reason;
+  if (outcomes.includes("match")) {
+    status = "ok";
+    failureReason = null;
+  } else if (outcomes.length > 0) {
+    status = "failed";
+    if (result === "no_match") {
+      failureReason =
+        reason ??
+        (kind === "link_summary"
+          ? "参考リンクに指定の姿・状況に当たる資料がありませんでした"
+          : "参考動画に指定の姿・状況に当たる区間がありませんでした");
+    }
+  }
+  data.background = {
+    ...data.background,
+    portrayal_focus_checks: checks,
+    portrayal_focus_status: status,
+    portrayal_focus_failure_reason: failureReason,
+  };
+}
+
+// CR-21: pull the portrayal verdict out of a generation write-back
+// result. The CR-21 contract is portrayal_focus_no_match: true plus
+// portrayal_focus_no_match_reason (a human-readable reason). A result
+// without the flag means the check found (or used) material normally.
+function extractPortrayalVerdict(parsed: Record<string, unknown>): {
+  noMatch: boolean;
+  reason: string | null;
+} {
+  if (parsed.portrayal_focus_no_match !== true)
+    return { noMatch: false, reason: null };
+  const raw =
+    typeof parsed.portrayal_focus_no_match_reason === "string"
+      ? parsed.portrayal_focus_no_match_reason.trim().slice(0, 1000)
+      : "";
+  return { noMatch: true, reason: raw || null };
+}
+
+// CR-21 (addendum): does this text look like the bare "no matching
+// material" notice the pre-CR-21 write-back contract produced — the
+// single sentence that once replaced whole summaries / video_notes
+// (「指定の姿・状況（…）に当たる資料はありませんでした」)? Used as a
+// storage guard: when a write-back reports portrayal_focus_no_match,
+// its content fields are supposed to carry the full-material content;
+// a content field that is missing, or that is just this notice, must
+// never overwrite the stored summary / notes — the stored content is
+// kept instead. A long text is never treated as the notice (a real
+// full-material summary may mention the miss in passing).
+function isPortrayalNoMatchNotice(text: string): boolean {
+  const t = text.trim();
+  if (t.length > 300) return false;
+  return (
+    t.includes("に当たる資料はありませんでした") ||
+    t.includes("に当たる区間はありませんでした") ||
+    (t.includes("指定の姿・状況") && t.includes("ありませんでした"))
+  );
+}
+
+// CR-21 (addendum 2): when portrayal_focus is REMOVED (set → cleared),
+// that save is a repair trigger: alongside the link/video re-queues,
+// the profile's avatar_memory is repaired too. The re-queue payloads
+// carry the current avatar_memory plus this instruction; the chat side
+// returns a repaired avatar_memory in the write-back result ONLY when
+// something actually had to be removed (completeGenerationRequest
+// applies a returned non-empty avatar_memory for requests whose
+// payload carries the avatar_memory_repair marker, and keeps the
+// stored memory untouched otherwise — an empty write-back never wipes
+// the memory). Saves where portrayal_focus does not actually change
+// never carry these fields: no re-queue, no memory repair.
+const AVATAR_MEMORY_REPAIR_NOTE =
+  "このプロファイルでは「演じる姿・状況」（portrayal_focus）の指定が削除されました。payload の avatar_memory（このプロファイル固有の記憶）に、以前の状況指定に由来して書き込まれた要素（指定の姿・状況を前提とする記述・その前提で生成された内容など）が含まれていれば、それらを取り除き、それ以外の事実経過は保持した avatar_memory を、書き戻し result の avatar_memory として返してください。状況指定に由来する要素が無ければ、avatar_memory は result に含めないでください（その場合は既存のメモリーがそのまま保持されます）。";
+
+function portrayalMemoryRepairFields(
+  data: ProfileData,
+): Record<string, unknown> {
+  return {
+    avatar_memory: data.avatar_memory,
+    avatar_memory_repair: true,
+    avatar_memory_repair_note: AVATAR_MEMORY_REPAIR_NOTE,
+  };
+}
+
+// Does this generation request's payload carry the CR-21 addendum-2
+// memory-repair marker? Only those requests' write-backs may replace
+// avatar_memory (and only with a non-empty returned value).
+function requestHasMemoryRepair(reqPayload: string): boolean {
+  try {
+    const p = JSON.parse(reqPayload) as unknown;
+    return !!(
+      p &&
+      typeof p === "object" &&
+      !Array.isArray(p) &&
+      (p as Record<string, unknown>).avatar_memory_repair === true
+    );
+  } catch {
+    return false;
+  }
 }
 
 // Extract structured speech fields from a generation write-back result.
@@ -1163,8 +1352,11 @@ function buildVideoTranscriptPayload(
   profileName: string,
   data: ProfileData,
   unprocessed: string[],
+  opts: { memoryRepair?: boolean } = {},
 ): string {
-  const pf = portrayalFocusValue(data);
+  // CR-21: while the bias is failed it is inactive — the payload then
+  // carries no portrayal keys, exactly like an unused field.
+  const pf = portrayalEffectiveValue(data);
   return JSON.stringify({
     name: profileName,
     video_urls: normalizeVideoUrls(data.background.video_urls),
@@ -1173,6 +1365,11 @@ function buildVideoTranscriptPayload(
     background_text: data.background.text.slice(0, 2000),
     summary: data.summary,
     user_relationship: data.background.user_relationship ?? null,
+    // CR-21 addendum 2: only when this queueing is the repair re-queue
+    // of a portrayal_focus removal — the current avatar_memory plus
+    // the instruction to strip specification-derived elements from it
+    // and return the repaired text in the write-back.
+    ...(opts.memoryRepair ? portrayalMemoryRepairFields(data) : {}),
     // CR-19: only when 「演じる姿・状況」 is set — the transcript work
     // is restricted to the chapters/segments matching that portrayal.
     ...(pf
@@ -1239,14 +1436,16 @@ async function queueVideoTranscriptRequest(
   profileId: string,
   profileName: string,
   data: ProfileData,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; memoryRepair?: boolean } = {},
 ): Promise<string | null> {
   const urls = normalizeVideoUrls(data.background.video_urls);
   if (urls.length === 0) return null;
   const unprocessed = opts.force ? urls : unprocessedVideoUrls(data);
   if (unprocessed.length === 0) return null;
   const db = ctx.db<typeof schema>();
-  const payload = buildVideoTranscriptPayload(profileName, data, unprocessed);
+  const payload = buildVideoTranscriptPayload(profileName, data, unprocessed, {
+    memoryRepair: opts.memoryRepair,
+  });
   const open = await db
     .select()
     .from(schema.generationRequests)
@@ -1518,6 +1717,20 @@ function mergePreservingManagedFields(
       portrayal_focus: before.background.portrayal_focus,
     };
   }
+  // CR-21: the portrayal check state (status / failure reason / per-kind
+  // check outcomes) is generation-managed — it is written only by
+  // completeGenerationRequest verdicts and by updateProfile's reset
+  // when portrayal_focus itself changes. A form or stub payload carries
+  // only schema defaults for it, so the stored state always wins here;
+  // updateProfile applies the reset AFTER this merge when the focus
+  // value actually changed.
+  out.background = {
+    ...out.background,
+    portrayal_focus_status: before.background.portrayal_focus_status,
+    portrayal_focus_failure_reason:
+      before.background.portrayal_focus_failure_reason,
+    portrayal_focus_checks: { ...before.background.portrayal_focus_checks },
+  };
   const linksOf = (d: ProfileData) => d.background.links.map((l) => l.trim()).filter(Boolean);
   if (
     !allowClear.includes("links") &&
@@ -2027,7 +2240,9 @@ async function toSwitchOut(
   const userRelationship = profData
     ? (profData.background.user_relationship ?? null)
     : null;
-  const pf = profData ? portrayalFocusValue(profData) : null;
+  // CR-21: a failed bias is inactive — the switch output then reports
+  // null/null (no bias), exactly like a profile not using the field.
+  const pf = profData ? portrayalEffectiveValue(profData) : null;
   return {
     id: row.id,
     profile_id: row.profileId,
@@ -2345,6 +2560,34 @@ export const Actions = {
       const portrayalChanged =
         (before.background.portrayal_focus?.trim() || null) !==
         (merged.background.portrayal_focus?.trim() || null);
+      // CR-21 addendum 2: the set → cleared transition specifically is
+      // a REPAIR trigger. The re-queues fired by this save (link_summary
+      // below, video_transcript further down) additionally carry the
+      // current avatar_memory with the instruction to strip any
+      // elements that were written into it because of the removed
+      // specification, so the unbiased write-backs repair the memory
+      // along with the summary / notes. Any other save — focus set,
+      // edited, or untouched — carries no repair fields at all.
+      const portrayalCleared =
+        portrayalChanged &&
+        !!(before.background.portrayal_focus?.trim()) &&
+        !(merged.background.portrayal_focus?.trim());
+      // CR-21: a changed (set / edited / cleared) portrayal_focus
+      // invalidates the previous check verdict — the state resets to
+      // 未判定 (unknown) with no recorded checks and no failure reason,
+      // and the CR-20 re-queue below re-judges it against the new
+      // specification. An unchanged save keeps the stored verdict.
+      if (portrayalChanged) {
+        merged.background = {
+          ...merged.background,
+          portrayal_focus_status: "unknown",
+          portrayal_focus_failure_reason: null,
+          portrayal_focus_checks: {
+            link_summary: null,
+            video_transcript: null,
+          },
+        };
+      }
       const requeue =
         (linksChanged || portrayalChanged) && newLinks.length > 0;
       const dataIn: ProfileData = requeue
@@ -2390,6 +2633,13 @@ export const Actions = {
             // CR-19: only when 「演じる姿・状況」 is set — the summary
             // is built from the matching parts of the links only.
             ...portrayalGenerationFields(clean),
+            // CR-21 addendum 2: only when this re-queue is the repair
+            // re-queue of a portrayal_focus removal — the current
+            // avatar_memory plus the strip-the-specification repair
+            // instruction (empty object otherwise).
+            ...(portrayalCleared
+              ? portrayalMemoryRepairFields(clean)
+              : {}),
             speech: mergedSpeechView(clean),
             speech_structured: {
               first_person: clean.speech.structured.first_person,
@@ -2453,6 +2703,10 @@ export const Actions = {
         ? null
         : await queueVideoTranscriptRequest(ctx, args.id, args.name, clean, {
             force: portrayalChanged,
+            // CR-21 addendum 2: a portrayal_focus removal makes this
+            // re-queue a repair re-queue — its payload also carries
+            // the avatar_memory repair fields.
+            memoryRepair: portrayalCleared,
           });
       // CR-03 今すぐ反映: exactly one follow-up request, shaped by whether
       // this profile is the active one. Trashed profiles get none (a
@@ -2530,8 +2784,8 @@ export const Actions = {
               summary: clean.summary,
               note:
                 "アクティブなプロファイルの更新を即時反映してください。口調・名前・呼び方は即時適用し、画像が変わっていれば候補生成→ユーザー選択→セットまで行ってください。user_relationship（私の扱い）が指定されている場合は、切り替え後のユーザーへの接し方（距離感・態度）の基準としてそれを正としてください。未指定（null）の場合は背景や呼び方から自然に推定される扱いのままで構いません。video_notes（参考動画の台詞から読み取れた口調の特徴）がある場合は、口調の参考資料として併せて使ってください。flavor（フレーバー設定）がある場合は、各項目の実効頻度（effective_frequency = 項目の frequency ?? 全体の level）に従って応答にキャラクターらしいフレーバーを出してください（実効0=その項目は出さない、1〜2=ここぞの場面だけ、3=節目に自然に、4〜5=頻繁に）。全体の level だけで判断せず、項目ごとの effective_frequency を優先してください。書き戻しは candidate_id と image_ref のみです。" +
-                (portrayalFocusValue(clean)
-                  ? ` ${portrayalActingNote(portrayalFocusValue(clean) as string)}`
+                (portrayalEffectiveValue(clean)
+                  ? ` ${portrayalActingNote(portrayalEffectiveValue(clean) as string)}`
                   : ""),
             }),
             status: "pending",
@@ -3278,7 +3532,9 @@ export const Actions = {
           // the sources); trial_conversation is acting (respond in
           // that portrayal/situation). When unset, no portrayal keys
           // are added and the payload is exactly as before.
-          const pf = portrayalFocusValue(data);
+          // CR-21: while the bias is failed it is inactive — no
+          // portrayal keys either (portrayalEffectiveValue is null).
+          const pf = portrayalEffectiveValue(data);
           if (pf) {
             obj.portrayal_focus = pf;
             obj.background_portrayal_focus = pf;
@@ -3390,7 +3646,7 @@ export const Actions = {
 
   completeGenerationRequest: defineAction({
     description:
-      "Writes back a generation request result, field-scoped to the request kind (other profile fields and edits made in the meantime are preserved, D-02/R-12). For link_summary, result JSON {summary, unreadable_links} is applied; for image_generation, result JSON {file, blob_key, source} is appended to the images; for trial_conversation the greeting text is stored. CR-06: link_summary / trial_conversation results may also carry structured speech fields — flat keys (first_person, second_person, call_user_as, catchphrase, memo, style) or a nested speech/speech_structured object — which are stored as auto-generated values; fields the user set manually (speech.sources = manual) are never overwritten. CR-08: those results may also carry flavor traits (flavor_traits, flavor.traits, or traits: [{label, examples[], scenes[], enabled}]). CR-20: flavor write-backs MERGE into the existing auto traits instead of replacing them — a trait whose label matches an existing auto trait is updated on top of it (examples union-merged; scenes/enabled/frequency keep the stored values), a new label is added as a new auto trait, and auto traits absent from the write-back are kept; manual flavor traits are kept exactly and the flavor level never changes. For profile_apply (CR-03), result JSON may carry only {candidate_id, image_ref} (image_ref also accepted as image_base.image_ref) — those two fields alone are written back and everything else is preserved; a failed profile_apply touches no profile field. CR-12: for flavor_examples, the result carries example lines per trait — {examples_by_trait: {<trait id>: [lines]}} (flavor_examples in the same shape, or a traits-style array, are also accepted) — and each line set is stored on its trait ONLY if that trait still has no examples (examples the user typed in the meantime win and are never overwritten); a failed flavor_examples touches no profile field and no preparation item. A link_summary / trial_conversation write-back that creates auto flavor traits with auto_examples on and no examples queues a flavor_examples request for them. On failed (other kinds), only that kind's preparation item flips to failed and the reason is stored on the profile (preparation_errors) so the UI can show it with a retry path (D-03). CR-17: for video_transcript, the result is {video_notes, catchphrases[], unreadable_videos[]} — video_notes is stored on background.video_notes, catchphrases and any other speech fields in the result are applied as auto tone material (manual speech fields are never overwritten, CR-06 rule), unreadable_videos are recorded on the profile, and every current video URL is marked attempted (video_processed_urls). CR-20: link_summary / trial_conversation speech write-backs follow the same merge rules as video_transcript (see CR-18 below), and video_transcript results may also carry flavor_traits, applied with the CR-20 flavor merge. CR-18: video_transcript speech write-backs MERGE with existing auto fields instead of replacing them — catchphrase is union-merged (stored items kept, new candidates appended, deduplicated, joined with '／'), first_person / second_person are filled only when currently unset (an existing value is never overwritten), and memo / style in the result are treated as text already integrated with the existing tone (the request payload's note instructs the chat side to return them that way) and applied to the auto field as returned. A completed batch where every video was unreadable and no notes were produced flips the video preparation item to failed with the unreadable list as the reason; a failed video_transcript flips only the video item to failed with the reason — in both cases the profile itself and all other fields stay untouched and the profile remains usable. Write-backs for trashed profiles are recorded on the request only.",
+      "Writes back a generation request result, field-scoped to the request kind (other profile fields and edits made in the meantime are preserved, D-02/R-12). For link_summary, result JSON {summary, unreadable_links} is applied; for image_generation, result JSON {file, blob_key, source} is appended to the images; for trial_conversation the greeting text is stored. CR-06: link_summary / trial_conversation results may also carry structured speech fields — flat keys (first_person, second_person, call_user_as, catchphrase, memo, style) or a nested speech/speech_structured object — which are stored as auto-generated values; fields the user set manually (speech.sources = manual) are never overwritten. CR-08: those results may also carry flavor traits (flavor_traits, flavor.traits, or traits: [{label, examples[], scenes[], enabled}]). CR-20: flavor write-backs MERGE into the existing auto traits instead of replacing them — a trait whose label matches an existing auto trait is updated on top of it (examples union-merged; scenes/enabled/frequency keep the stored values), a new label is added as a new auto trait, and auto traits absent from the write-back are kept; manual flavor traits are kept exactly and the flavor level never changes. For profile_apply (CR-03), result JSON may carry only {candidate_id, image_ref} (image_ref also accepted as image_base.image_ref) — those two fields alone are written back and everything else is preserved; a failed profile_apply touches no profile field. CR-12: for flavor_examples, the result carries example lines per trait — {examples_by_trait: {<trait id>: [lines]}} (flavor_examples in the same shape, or a traits-style array, are also accepted) — and each line set is stored on its trait ONLY if that trait still has no examples (examples the user typed in the meantime win and are never overwritten); a failed flavor_examples touches no profile field and no preparation item. A link_summary / trial_conversation write-back that creates auto flavor traits with auto_examples on and no examples queues a flavor_examples request for them. On failed (other kinds), only that kind's preparation item flips to failed and the reason is stored on the profile (preparation_errors) so the UI can show it with a retry path (D-03). CR-17: for video_transcript, the result is {video_notes, catchphrases[], unreadable_videos[]} — video_notes is stored on background.video_notes, catchphrases and any other speech fields in the result are applied as auto tone material (manual speech fields are never overwritten, CR-06 rule), unreadable_videos are recorded on the profile, and every current video URL is marked attempted (video_processed_urls). CR-20: link_summary / trial_conversation speech write-backs follow the same merge rules as video_transcript (see CR-18 below), and video_transcript results may also carry flavor_traits, applied with the CR-20 flavor merge. CR-18: video_transcript speech write-backs MERGE with existing auto fields instead of replacing them — catchphrase is union-merged (stored items kept, new candidates appended, deduplicated, joined with '／'), first_person / second_person are filled only when currently unset (an existing value is never overwritten), and memo / style in the result are treated as text already integrated with the existing tone (the request payload's note instructs the chat side to return them that way) and applied to the auto field as returned. A completed batch where every video was unreadable and no notes were produced flips the video preparation item to failed with the unreadable list as the reason; a failed video_transcript flips only the video item to failed with the reason — in both cases the profile itself and all other fields stay untouched and the profile remains usable. Write-backs for trashed profiles are recorded on the request only. CR-21: completed link_summary / video_transcript write-backs also record a portrayal verdict against the profile's current portrayal_focus (background.portrayal_focus_checks): result portrayal_focus_no_match: true (with portrayal_focus_no_match_reason) records a no_match for that kind; otherwise a completed link_summary records a match, and a video_transcript records a match when it produced video_notes (an all-unreadable batch with no notes records nothing unless the flag is present). The derived background.portrayal_focus_status is ok when any recorded check matched, failed when at least one check completed and all recorded checks are no_match (the latest reason is kept in portrayal_focus_failure_reason), and unknown otherwise. The verdict never alters content: a no-match write-back's summary/video_notes are stored exactly as returned (under the CR-21 contract they are built from all material), and the preparation state is untouched — a failed bias does not make the profile 要対応 and it stays ready/usable. While failed, the bias is inactive for switch output and every payload until a later check records a match. CR-21 addendum guard: when a result carries portrayal_focus_no_match, a summary / video_notes field that is missing — or that is just the bare 'no matching material' notice sentence — never overwrites the stored link_summary / video_notes; the stored full content is kept (only the verdict is recorded). CR-21 addendum 2: for link_summary / video_transcript requests whose payload carries the avatar_memory_repair marker (queued by updateProfile when portrayal_focus was removed), a completed result that returns a non-empty avatar_memory replaces the stored avatar_memory (the repaired text: specification-derived elements removed, other facts kept); a result without avatar_memory — or with an empty one — leaves the stored memory exactly as it was, and write-backs of non-repair requests never touch avatar_memory at all.",
     request: z.object({
       request_id: z.string().min(1),
       status: z.enum(["processing", "completed", "failed"]),
@@ -3427,6 +3683,10 @@ export const Actions = {
             if (req.kind === "trial_conversation") parsed = { greeting: args.result };
           }
         }
+        // CR-21 addendum 2: only a request queued as a portrayal_focus
+        // removal repair (its payload carries the marker) may replace
+        // avatar_memory through its write-back.
+        const memoryRepairRequested = requestHasMemoryRepair(req.payload);
         const prof = await db
           .select()
           .from(schema.profiles)
@@ -3519,17 +3779,62 @@ export const Actions = {
               }
             }
             if (req.kind === "link_summary") {
+              // CR-21: this check's portrayal verdict (see the record
+              // call below). Computed first because it also drives the
+              // storage guard on the summary.
+              const verdict = extractPortrayalVerdict(parsed);
               // Truncate to the profile schema limits: an over-long
               // write-back would make the next parseData throw and fall
               // back to all-defaults, wiping every field (D-02 class).
+              // CR-21 addendum guard: when the write-back reports
+              // no-match, its summary is stored as the full-material
+              // content — but if the summary field is missing (the
+              // typeof check) or is just the bare "no material" notice
+              // sentence, the stored summary is KEPT instead of being
+              // overwritten by the notice (the pre-CR-21 data loss).
               if (typeof parsed.summary === "string") {
-                data.background.link_summary = parsed.summary.slice(0, 5000);
+                if (
+                  !(
+                    verdict.noMatch &&
+                    isPortrayalNoMatchNotice(parsed.summary)
+                  )
+                ) {
+                  data.background.link_summary = parsed.summary.slice(0, 5000);
+                }
               }
               if (Array.isArray(parsed.unreadable_links)) {
                 data.background.unreadable_links = parsed.unreadable_links
                   .filter((u): u is string => typeof u === "string")
                   .map((u) => u.slice(0, 2000))
                   .slice(0, 20);
+              }
+              // CR-21: record the verdict. Under the CR-21 contract a
+              // no-match write-back still carries the full-material
+              // summary (stored above, exactly as returned) plus
+              // portrayal_focus_no_match /
+              // portrayal_focus_no_match_reason; the verdict only moves
+              // the check state, never the content.
+              recordPortrayalCheck(
+                data,
+                "link_summary",
+                verdict.noMatch ? "no_match" : "match",
+                verdict.reason,
+              );
+              // CR-21 addendum 2: avatar_memory repair — when this
+              // request was queued by a portrayal_focus removal and
+              // the write-back returns a (non-empty) avatar_memory,
+              // it replaces the stored memory (the chat side removed
+              // the specification-derived elements and kept the other
+              // facts). No returned avatar_memory — or an empty one —
+              // keeps the stored memory exactly as it was.
+              if (
+                memoryRepairRequested &&
+                typeof parsed.avatar_memory === "string" &&
+                parsed.avatar_memory.trim()
+              ) {
+                data.avatar_memory = parsed.avatar_memory
+                  .trim()
+                  .slice(0, 20000);
               }
             }
             if (req.kind === "image_generation") {
@@ -3716,9 +4021,22 @@ export const Actions = {
                   .slice(0, 20)
               : [];
           if (args.status === "completed") {
+            // CR-21: this batch's portrayal verdict — computed first
+            // because it also drives the storage guard on video_notes.
+            const verdict = extractPortrayalVerdict(parsed);
+            // CR-21 addendum guard: when the write-back reports
+            // no-match, video_notes is stored as the full-material
+            // content — but if the field is missing, or is just the
+            // bare "no matching segment" notice sentence, the stored
+            // notes are KEPT instead of being overwritten by the
+            // notice (the pre-CR-21 data loss).
             if (
               typeof parsed.video_notes === "string" &&
-              parsed.video_notes.trim()
+              parsed.video_notes.trim() &&
+              !(
+                verdict.noMatch &&
+                isPortrayalNoMatchNotice(parsed.video_notes)
+              )
             ) {
               // Schema limit (video_notes max 5000) — see link_summary.
               data.background.video_notes = parsed.video_notes
@@ -3760,6 +4078,45 @@ export const Actions = {
               data.flavor = applyAutoFlavorTraits(data, videoFlavorUpdates).flavor;
             }
             data.background.video_processed_urls = [...currentUrls];
+            // CR-21: record this batch's portrayal verdict. Under the
+            // CR-21 contract a no-match write-back still carries
+            // video_notes built from the whole transcript (stored
+            // above) plus portrayal_focus_no_match /
+            // portrayal_focus_no_match_reason. A batch that produced
+            // notes counts as evaluated; a batch where every video was
+            // unreadable and no notes exist never got to judge the
+            // portrayal at all, so it records a verdict ONLY when the
+            // result explicitly carries the no-match flag.
+            {
+              const producedNotes = !!(
+                typeof parsed.video_notes === "string" &&
+                parsed.video_notes.trim()
+              );
+              if (verdict.noMatch) {
+                recordPortrayalCheck(
+                  data,
+                  "video_transcript",
+                  "no_match",
+                  verdict.reason,
+                );
+              } else if (producedNotes) {
+                recordPortrayalCheck(data, "video_transcript", "match", null);
+              }
+            }
+            // CR-21 addendum 2: avatar_memory repair — same rule as
+            // the link_summary write-back: a repair request whose
+            // result returns a non-empty avatar_memory replaces the
+            // stored memory (specification-derived elements removed,
+            // other facts kept); no returned value keeps it untouched.
+            if (
+              memoryRepairRequested &&
+              typeof parsed.avatar_memory === "string" &&
+              parsed.avatar_memory.trim()
+            ) {
+              data.avatar_memory = parsed.avatar_memory
+                .trim()
+                .slice(0, 20000);
+            }
             // Preparation outcome: every video unreadable and no notes
             // at all means the batch produced nothing — that is a
             // failure the user must see (with the unreadable list as
