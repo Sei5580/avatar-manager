@@ -1,0 +1,107 @@
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-lg: 18px;
+  --text-lg--line-height: 28px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --text-2xl: 24px;
+  --text-2xl--line-height: 32px;
+  --text-3xl: 30px;
+  --text-3xl--line-height: 36px;
+  --text-4xl: 36px;
+  --text-4xl--line-height: 40px;
+  --text-5xl: 48px;
+  --text-5xl--line-height: 52px;
+}
+
+:root {
+  color-scheme: light dark;
+  --bg: #faf6f2;
+  --surface: #fffdfb;
+  --surface-alt: #f3ebe5;
+  --text: #221a18;
+  --dim: #7a6a64;
+  --border: #e9ddd8;
+  --accent: #b3232a;
+  --accent-ink: #ffffff;
+  --gold: #d9930d;
+  --teal: #0e7c6b;
+  --radius: 14px;
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface-alt);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #171110;
+    --surface: #221a18;
+    --surface-alt: #2c211d;
+    --text: #f5ece7;
+    --dim: #b3a099;
+    --border: #40322d;
+    --accent: #e05257;
+    --accent-ink: #ffffff;
+    --gold: #e8a812;
+    --teal: #2fbfa5;
+  }
+}
+
+.font-display {
+  font-family: "Shippori Mincho", "Hiragino Mincho ProN", "Yu Mincho", serif;
+}
+
+/* CR-11: focus carousel switch — slide in from the travel direction
+   while fading in. Applied to the incoming card only (keyed remount). */
+@keyframes focus-in-from-right {
+  from {
+    opacity: 0;
+    transform: translateX(56px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes focus-in-from-left {
+  from {
+    opacity: 0;
+    transform: translateX(-56px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.focus-slide-next {
+  animation: focus-in-from-right 0.38s ease both;
+}
+
+.focus-slide-prev {
+  animation: focus-in-from-left 0.38s ease both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .focus-slide-next,
+  .focus-slide-prev {
+    animation: none;
+  }
+}
+
+@layer base {
+  button, [role="button"], select, summary, input:not([type="checkbox"], [type="radio"]) {
+    min-height: 2.25rem;
+  }
+}

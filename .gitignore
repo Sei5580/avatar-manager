@@ -1,0 +1,11 @@
+node_modules/
+app.db
+app.db-shm
+app.db-wal
+blobs/
+audits/
+.harness/
+dist/
+*.tsbuildinfo
+.env
+.env.*
