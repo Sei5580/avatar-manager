@@ -1,8 +1,8 @@
 {
-  "runtime": "typescript",
-  "platformVersion": 29,
   "entry": "client/dist/index.html",
+  "managedCronJobs": [],
   "name": "アバター総合管理",
-  "slug": "abatazong-he-guan-li",
-  "managedCronJobs": []
+  "platformVersion": 31,
+  "runtime": "typescript",
+  "slug": "abatazong-he-guan-li"
 }
