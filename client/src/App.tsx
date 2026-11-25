@@ -629,6 +629,26 @@ function primaryImageSrc(p: Profile): string | null {
   return null;
 }
 
+// CR-23: a YouTube playlist URL (youtube.com/playlist?list=…) can be a
+// 参考動画URL — the chat side transcribes every video in the list.
+// Mirrors the server-side detection in actions.ts.
+function isYouTubePlaylistUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw.trim());
+    const host = u.hostname.toLowerCase();
+    if (
+      host !== "youtube.com" &&
+      host !== "www.youtube.com" &&
+      host !== "m.youtube.com" &&
+      host !== "music.youtube.com"
+    )
+      return false;
+    return u.pathname === "/playlist" && !!u.searchParams.get("list");
+  } catch {
+    return false;
+  }
+}
+
 function statusLabel(s: string): string {
   switch (s) {
     case "pending":
@@ -1688,16 +1708,21 @@ function ProfileFormFields({
           </div>
           <div>
             <span className="text-sm font-semibold">参考動画URL（複数可）</span>
-            <p className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>動画は文字起こしを取得し、台詞を口調の参考にします。参考リンクとは別扱いです（動画を通常のWebページとして読むことはしません）。保存すると、まだ処理していない動画について文字起こしの取得を自動で依頼します。</p>
+            <p className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>文字起こし（字幕）を取得できる動画サイトのURLを指定してください（推奨：YouTube）。YouTubeの再生リストURLも指定できます。その場合は、リスト内の各動画の文字起こしを取得します。動画の台詞は口調の参考にします。参考リンクとは別扱いです（動画を通常のWebページとして読むことはしません）。保存すると、まだ処理していない動画について文字起こしの取得を自動で依頼します。</p>
             {form.bgVideoUrls.length === 0 && (
               <div className="mt-2 flex gap-2">
-                <input aria-label="参考動画URL 1" className={inputCls} style={inputStyle} value="" placeholder="https://…（YouTubeなどの動画URL）" onChange={(e) => set({ bgVideoUrls: [e.target.value] })} />
+                <input aria-label="参考動画URL 1" className={inputCls} style={inputStyle} value="" placeholder="https://…（YouTubeの動画URL／再生リストURL）" onChange={(e) => set({ bgVideoUrls: [e.target.value] })} />
               </div>
             )}
             {form.bgVideoUrls.map((link, i) => (
-              <div key={i} className="mt-2 flex gap-2">
-                <input aria-label={`参考動画URL ${i + 1}`} className={inputCls} style={inputStyle} value={link} placeholder="https://…" onChange={(e) => { const next = [...form.bgVideoUrls]; next[i] = e.target.value; set({ bgVideoUrls: next }); }} />
-                <button type="button" aria-label={`参考動画URL ${i + 1} を削除`} className="shrink-0 rounded-lg px-3 text-sm font-semibold shadow-sm transition hover:opacity-90 active:scale-[0.98]" style={{ border: "1.5px solid var(--border)", background: "var(--surface-alt)" }} onClick={() => set({ bgVideoUrls: form.bgVideoUrls.filter((_, j) => j !== i) })}>削除</button>
+              <div key={i} className="mt-2">
+                <div className="flex gap-2">
+                  <input aria-label={`参考動画URL ${i + 1}`} className={inputCls} style={inputStyle} value={link} placeholder="https://…" onChange={(e) => { const next = [...form.bgVideoUrls]; next[i] = e.target.value; set({ bgVideoUrls: next }); }} />
+                  <button type="button" aria-label={`参考動画URL ${i + 1} を削除`} className="shrink-0 rounded-lg px-3 text-sm font-semibold shadow-sm transition hover:opacity-90 active:scale-[0.98]" style={{ border: "1.5px solid var(--border)", background: "var(--surface-alt)" }} onClick={() => set({ bgVideoUrls: form.bgVideoUrls.filter((_, j) => j !== i) })}>削除</button>
+                </div>
+                {isYouTubePlaylistUrl(link) && (
+                  <p className="mt-1 text-xs font-semibold" style={{ color: "var(--teal)" }}>YouTubeの再生リストとして認識しました（リスト内の各動画の文字起こしを取得します）</p>
+                )}
               </div>
             ))}
             <button type="button" aria-label="参考動画URLを追加" className="mt-2 rounded-lg px-3 py-1.5 text-sm font-bold shadow-sm transition hover:opacity-90 active:scale-[0.98]" style={{ border: "1.5px solid var(--border)", background: "var(--surface-alt)" }} onClick={() => set({ bgVideoUrls: [...form.bgVideoUrls, ""] })}>＋ 動画URLを追加</button>
@@ -3935,6 +3960,9 @@ function DetailView({
                   {(profile.background.video_urls ?? []).map((u) => (
                     <li key={u} className="break-all">
                       <a href={u} target="_blank" rel="noreferrer" className="underline" style={{ color: "var(--teal)" }}>{u}</a>
+                      {isYouTubePlaylistUrl(u) && (
+                        <span className="ml-2 inline-block rounded-full px-2 py-0.5 align-middle text-xs font-bold" style={{ border: "1.5px solid var(--teal)", color: "var(--teal)" }}>再生リスト（各動画を文字起こし）</span>
+                      )}
                     </li>
                   ))}
                 </ul>
