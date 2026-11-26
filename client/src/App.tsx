@@ -636,6 +636,24 @@ function primaryImageSrc(p: Profile): string | null {
   return null;
 }
 
+// CR-25: thumbnail version of the primary image (server-generated
+// WebP, max 768px, pre-generated at profile creation / update / switch
+// time and stored as a blob — see pregeneratePrimaryThumb in
+// actions.ts). List cards, focus view, peeks, and tiles render THIS
+// instead of the full-size original, so the list no longer downloads
+// every original just to show small cards. Falls back to the original
+// (primaryImageSrc) whenever no thumbnail exists, so a display never
+// breaks; the detail screen's image grid keeps the originals.
+function primaryThumbSrc(p: Profile): string | null {
+  const primary = p.images.find((i) => i.is_primary);
+  const ref = p.image_base.image_ref;
+  const entry =
+    primary ??
+    (ref ? p.images.find((i) => i.blob_key === ref || i.file === ref) : undefined);
+  if (entry?.thumb_url) return entry.thumb_url;
+  return primaryImageSrc(p);
+}
+
 // CR-23: a YouTube playlist URL (youtube.com/playlist?list=…) can be a
 // 参考動画URL — the chat side transcribes every video in the list.
 // Mirrors the server-side detection in actions.ts.
@@ -955,13 +973,15 @@ function AvatarTile({
   profile: Profile;
   size: number;
 }) {
-  const src = primaryImageSrc(profile);
+  const src = primaryThumbSrc(profile);
   const color = profile.theme_color || DEFAULT_THEME_COLOR;
   if (src) {
     return (
       <img
         src={src}
         alt={`${profile.name}の画像`}
+        loading="lazy"
+        decoding="async"
         className="shrink-0 rounded-xl object-cover"
         style={{ width: size, height: size, border: `2px solid ${color}` }}
       />
@@ -1006,7 +1026,7 @@ function CardAvatarImage({
   profile: Profile;
   size: number;
 }) {
-  const src = primaryImageSrc(profile);
+  const src = primaryThumbSrc(profile);
   const color = profile.theme_color || DEFAULT_THEME_COLOR;
   if (src) {
     return (
@@ -1023,11 +1043,15 @@ function CardAvatarImage({
           src={src}
           alt=""
           aria-hidden="true"
+          loading="lazy"
+          decoding="async"
           className="absolute inset-0 h-full w-full scale-110 object-cover opacity-40 blur-lg"
         />
         <img
           src={src}
           alt={`${profile.name}の画像`}
+          loading="lazy"
+          decoding="async"
           className="relative h-full w-full object-contain"
         />
       </div>
@@ -2310,7 +2334,7 @@ function FocusView({
     onError: (e) => setError(e instanceof Error ? e.message : "お気に入りの変更に失敗しました。"),
   });
 
-  const src = primaryImageSrc(profile);
+  const src = primaryThumbSrc(profile);
   // CR-10: the focus card is tinted/bordered with the theme color too.
   const color = profile.theme_color || DEFAULT_THEME_COLOR;
   const overviewRaw =
@@ -2340,7 +2364,7 @@ function FocusView({
   // mini card (theme band + whole image + name) shifted so only its edge
   // shows inside the side strip, semi-transparent, purely decorative.
   const renderPeek = (p: Profile, side: "left" | "right") => {
-    const pSrc = primaryImageSrc(p);
+    const pSrc = primaryThumbSrc(p);
     const pColor = p.theme_color || DEFAULT_THEME_COLOR;
     return (
       <div
@@ -2363,6 +2387,8 @@ function FocusView({
             <img
               src={pSrc}
               alt=""
+              loading="lazy"
+              decoding="async"
               className="h-28 w-full object-contain"
               style={{
                 background: `color-mix(in srgb, ${pColor} 12%, var(--surface-alt))`,
@@ -2414,11 +2440,13 @@ function FocusView({
                 src={src}
                 alt=""
                 aria-hidden="true"
+                decoding="async"
                 className="absolute inset-0 h-full w-full scale-110 object-cover opacity-40 blur-xl"
               />
               <img
                 src={src}
                 alt={`${profile.name}の画像`}
+                decoding="async"
                 className="relative h-full w-full object-contain"
               />
             </div>

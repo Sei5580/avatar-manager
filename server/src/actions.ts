@@ -2096,7 +2096,14 @@ const profileOutSchema = z.object({
   preparation_errors: preparationErrorsSchema,
   background: profileDataSchema.shape.background,
   images: z.array(
-    imageEntrySchema.extend({ url: z.string().nullable().default(null) }),
+    imageEntrySchema.extend({
+      url: z.string().nullable().default(null),
+      // CR-25: URL of the server-generated thumbnail (WebP, max 768px)
+      // for this image when it is the profile's primary image; null for
+      // non-primary images and whenever thumbnail generation failed
+      // (displays then fall back to `url`, the full-size original).
+      thumb_url: z.string().nullable().default(null),
+    }),
   ),
   image_base: profileDataSchema.shape.image_base,
   call_user_as: z.string().nullable(),
@@ -2159,46 +2166,221 @@ function parseData(raw: string): ProfileData {
   }
 }
 
+// ---------------------------------------------------------------------------
+// CR-25: thumbnails for the profile list (一覧の軽量化)
+// ---------------------------------------------------------------------------
+//
+// The list used to hand every profile's FULL-SIZE primary image to the
+// browser (plus every other stored image's URL, and the full profile
+// body), so opening the list downloaded megabytes of originals just to
+// render 96px cards. Now:
+// - each profile's primary image gets a server-generated thumbnail
+//   (WebP, longest side <= THUMB_MAX_SIZE px) produced host-side by the
+//   privileged makeThumbnail handler and stored as a blob under
+//   thumbs/<hash>.webp; displays in the list / focus / tiles use
+//   thumb_url and fall back to the original url when no thumbnail
+//   exists. Thumbnails are PRE-GENERATED when a profile is created,
+//   updated, switched to, or gains an image (upload / URL / primary
+//   change / generation write-back) — see pregeneratePrimaryThumb —
+//   and cached under a hash of the source (blob key or external URL),
+//   so a replaced image gets a fresh thumbnail key automatically.
+//   The lazy generation on read in toProfileOut remains only as a
+//   safety net for profiles created before thumbnails existed.
+// - listProfiles uses the LIGHT form of toProfileOut: only the primary
+//   image entry is returned (not all <=30), the long background text /
+//   link summary are truncated to what the cards and focus overview
+//   actually show, avatar_memory / video_notes (never displayed in the
+//   list) are emptied, and the pending-request counts come from two
+//   batched queries instead of two queries per profile.
+// Detail reads (getProfile) keep the full form; only their primary
+// image carries a thumb_url (the detail image grid keeps originals).
+
+const THUMB_MAX_SIZE = 768;
+
+function thumbKeyFor(sourceId: string): string {
+  // Two independent 32-bit hashes (FNV-1a + djb2) over the source id —
+  // a deterministic cache key for one source image's thumbnail blob.
+  let fnv = 0x811c9dc5;
+  let djb = 5381;
+  for (let i = 0; i < sourceId.length; i++) {
+    const c = sourceId.charCodeAt(i);
+    fnv = Math.imul(fnv ^ c, 0x01000193);
+    djb = (Math.imul(djb, 33) + c) | 0;
+  }
+  const h = (n: number) => (n >>> 0).toString(16).padStart(8, "0");
+  return `thumbs/${h(fnv)}${h(djb)}.webp`;
+}
+
+type ImageEntry = z.infer<typeof imageEntrySchema>;
+
+// Returns the thumbnail URL for one image entry, generating and storing
+// the thumbnail first when it does not exist yet. Best-effort: ANY
+// failure (no privileged declaration on the calling action, missing
+// blob, undecodable image, …) returns null and the display falls back
+// to the original image.
+async function ensureThumbUrl(
+  ctx: Ctx,
+  img: Pick<ImageEntry, "blob_key" | "file" | "source">,
+): Promise<string | null> {
+  const blobKey = img.blob_key;
+  const sourceUrl =
+    !blobKey && img.source === "url" && /^https?:\/\//.test(img.file)
+      ? img.file
+      : null;
+  if (!blobKey && !sourceUrl) return null;
+  const key = thumbKeyFor(blobKey ?? (sourceUrl as string));
+  try {
+    if (await ctx.blobs.head(key)) return await ctx.blobs.getUrl(key);
+    const res = await ctx.executePrivileged(privileged.makeThumbnail, {
+      space_dir: ctx.spaceDir,
+      blob_key: blobKey,
+      source_url: sourceUrl,
+      max_size: THUMB_MAX_SIZE,
+    });
+    if (!res.ok || !res.data_base64) return null;
+    const bytes = Buffer.from(res.data_base64, "base64");
+    if (bytes.length === 0) return null;
+    await ctx.blobs.put(key, bytes, {
+      contentType: res.content_type ?? "image/webp",
+    });
+    return await ctx.blobs.getUrl(key);
+  } catch {
+    return null;
+  }
+}
+
+// CR-25 (follow-up): pre-generate the primary image's thumbnail at
+// profile creation / update / switch time — in particular for images
+// specified by URL — so opening the list never has to wait for (or
+// pay) generation. Best-effort: ensureThumbUrl never throws, and a
+// failure simply leaves the list-time lazy fallback to do it later.
+// The stored profile JSON is never touched: the original image URL /
+// blob key stays exactly as it was, and the thumbnail lives alongside
+// as a separate blob (see the export note in exportProfile).
+async function pregeneratePrimaryThumb(
+  ctx: Ctx,
+  data: ProfileData,
+): Promise<void> {
+  const ref = data.image_base.image_ref;
+  const primary =
+    data.images.find((i) => i.is_primary) ??
+    (ref
+      ? data.images.find((i) => i.blob_key === ref || i.file === ref)
+      : undefined);
+  if (primary) {
+    await ensureThumbUrl(ctx, primary);
+    return;
+  }
+  if (ref && /^https?:\/\//.test(ref)) {
+    await ensureThumbUrl(ctx, { blob_key: null, file: ref, source: "url" });
+  }
+}
+
 async function toProfileOut(
   ctx: Ctx,
   row: ProfileRow,
+  opts?: {
+    // CR-25: light form for listProfiles (see the CR-25 note above).
+    light?: boolean;
+    // CR-25: precomputed pending counts (listProfiles batches these);
+    // when omitted they are queried per profile as before.
+    counts?: { pending_switch_count: number; pending_apply_count: number };
+  },
 ): Promise<z.infer<typeof profileOutSchema>> {
   const data = parseData(row.data);
   const db = ctx.db<typeof schema>();
-  const swRows = await db
-    .select({ status: schema.switchRequests.status })
-    .from(schema.switchRequests)
-    .where(eq(schema.switchRequests.profileId, row.id));
-  const pending_switch_count = swRows.filter(
-    (r) => r.status === "pending" || r.status === "processing",
-  ).length;
-  const genRows = await db
-    .select({ status: schema.generationRequests.status })
-    .from(schema.generationRequests)
-    .where(
-      and(
-        eq(schema.generationRequests.profileId, row.id),
-        eq(schema.generationRequests.kind, "profile_apply"),
-      ),
-    );
-  const pending_apply_count = genRows.filter(
-    (r) => r.status === "pending" || r.status === "processing",
-  ).length;
-  const images = await Promise.all(
-    data.images.map(async (img) => {
-      // A missing blob (e.g. an image_ref recovered after D-02 whose blob
-      // is gone) must not take the whole profile read down with it.
-      let url: string | null = null;
-      if (img.blob_key) {
-        try {
-          url = await ctx.blobs.getUrl(img.blob_key);
-        } catch {
-          url = null;
-        }
+  let pending_switch_count: number;
+  let pending_apply_count: number;
+  if (opts?.counts) {
+    pending_switch_count = opts.counts.pending_switch_count;
+    pending_apply_count = opts.counts.pending_apply_count;
+  } else {
+    const swRows = await db
+      .select({ status: schema.switchRequests.status })
+      .from(schema.switchRequests)
+      .where(eq(schema.switchRequests.profileId, row.id));
+    pending_switch_count = swRows.filter(
+      (r) => r.status === "pending" || r.status === "processing",
+    ).length;
+    const genRows = await db
+      .select({ status: schema.generationRequests.status })
+      .from(schema.generationRequests)
+      .where(
+        and(
+          eq(schema.generationRequests.profileId, row.id),
+          eq(schema.generationRequests.kind, "profile_apply"),
+        ),
+      );
+    pending_apply_count = genRows.filter(
+      (r) => r.status === "pending" || r.status === "processing",
+    ).length;
+  }
+  // The effective primary image, mirroring the client's
+  // primaryImageSrc: the entry flagged is_primary, else the entry the
+  // image_base ref points at.
+  const ref = data.image_base.image_ref;
+  const primaryEntry =
+    data.images.find((i) => i.is_primary) ??
+    (ref
+      ? data.images.find((i) => i.blob_key === ref || i.file === ref)
+      : undefined);
+  const mapImage = async (
+    img: ImageEntry,
+  ): Promise<z.infer<typeof profileOutSchema>["images"][number]> => {
+    // A missing blob (e.g. an image_ref recovered after D-02 whose blob
+    // is gone) must not take the whole profile read down with it.
+    let url: string | null = null;
+    if (img.blob_key) {
+      try {
+        url = await ctx.blobs.getUrl(img.blob_key);
+      } catch {
+        url = null;
       }
-      return { ...img, url };
-    }),
-  );
+    }
+    const thumb_url =
+      primaryEntry && img.id === primaryEntry.id
+        ? await ensureThumbUrl(ctx, img)
+        : null;
+    return { ...img, url, thumb_url };
+  };
+  let images: z.infer<typeof profileOutSchema>["images"];
+  if (opts?.light) {
+    if (primaryEntry) {
+      images = [await mapImage(primaryEntry)];
+    } else if (ref && /^https?:\/\//.test(ref)) {
+      // The primary image is a bare external URL with no images entry:
+      // synthesize the entry the client's primaryImageSrc resolves to,
+      // so the list can still use a thumbnail for it.
+      const synth: ImageEntry = {
+        id: "im_primary_ref",
+        file: ref,
+        blob_key: null,
+        is_primary: true,
+        source: "url",
+      };
+      images = [
+        { ...synth, url: ref, thumb_url: await ensureThumbUrl(ctx, synth) },
+      ];
+    } else {
+      images = [];
+    }
+  } else {
+    images = await Promise.all(data.images.map(mapImage));
+  }
+  // CR-25 light form: truncate/empty the fields the list never shows
+  // in full (the focus overview reads at most ~400 chars of background
+  // text / link summary; avatar_memory and video_notes are not shown
+  // in the list at all). Detail reads keep everything.
+  const background = opts?.light
+    ? {
+        ...data.background,
+        text: data.background.text.slice(0, 600),
+        link_summary: data.background.link_summary
+          ? data.background.link_summary.slice(0, 600)
+          : null,
+        video_notes: null,
+      }
+    : data.background;
   return {
     format: "avatar-profile",
     format_version: "1.0",
@@ -2208,7 +2390,7 @@ async function toProfileOut(
     greeting: data.greeting ?? "",
     preparation: data.preparation,
     preparation_errors: data.preparation_errors,
-    background: data.background,
+    background,
     images,
     image_base: data.image_base,
     call_user_as: data.call_user_as,
@@ -2217,7 +2399,7 @@ async function toProfileOut(
     theme_color: data.theme_color ?? DEFAULT_THEME_COLOR,
     theme_color_source: data.theme_color_source ?? "default",
     voice: data.voice,
-    avatar_memory: data.avatar_memory,
+    avatar_memory: opts?.light ? "" : data.avatar_memory,
     switch_settings: {
       pass_conversation_summary: false,
       use_shared_info: data.switch_settings.use_shared_info,
@@ -2622,7 +2804,7 @@ async function insertProfile(
 export const Actions = {
   listProfiles: defineAction({
     description:
-      "Lists avatar profiles (not deleted) in the requested sort order, plus the active profile id and the latest switch requests.",
+      "Lists avatar profiles (not deleted) in the requested sort order, plus the active profile id and the latest switch requests. CR-25: the list form is lightweight — each profile carries only its primary image entry (with a server-generated WebP thumbnail URL, max 768px, in thumb_url alongside the original url), long background text / link summaries are truncated to the excerpts the list and focus views show, avatar_memory / video_notes are emptied, and pending-request counts are computed with two batched queries for the whole list. Use getProfile for a profile's full body.",
     request: z.object({
       sort: z.enum(["last_used", "name", "created"]).default("last_used"),
     }),
@@ -2631,6 +2813,7 @@ export const Actions = {
       active_id: z.string().nullable(),
       switch_requests: z.array(switchRequestOut),
     }),
+    privileged: [privileged.makeThumbnail],
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const rows = await db
@@ -2647,8 +2830,40 @@ export const Actions = {
         const bu = b.lastUsedAt?.getTime() ?? b.updatedAt.getTime();
         return bu - au;
       });
+      // CR-25: pending counts for the whole list from two batched
+      // queries (previously two queries PER profile in toProfileOut).
+      const allSwitchRows = await db
+        .select({
+          profileId: schema.switchRequests.profileId,
+          status: schema.switchRequests.status,
+        })
+        .from(schema.switchRequests);
+      const allApplyRows = await db
+        .select({
+          profileId: schema.generationRequests.profileId,
+          status: schema.generationRequests.status,
+        })
+        .from(schema.generationRequests)
+        .where(eq(schema.generationRequests.kind, "profile_apply"));
+      const countOpen = (
+        rows: { profileId: string | null; status: string }[],
+        id: string,
+      ) =>
+        rows.filter(
+          (r) =>
+            r.profileId === id &&
+            (r.status === "pending" || r.status === "processing"),
+        ).length;
       const profiles = await Promise.all(
-        sorted.map((r) => toProfileOut(ctx, r)),
+        sorted.map((r) =>
+          toProfileOut(ctx, r, {
+            light: true,
+            counts: {
+              pending_switch_count: countOpen(allSwitchRows, r.id),
+              pending_apply_count: countOpen(allApplyRows, r.id),
+            },
+          }),
+        ),
       );
       const active = rows.find((r) => r.isActive);
       const reqRows = await db
@@ -2664,9 +2879,11 @@ export const Actions = {
   }),
 
   getProfile: defineAction({
-    description: "Returns one avatar profile by id (including trashed ones).",
+    description:
+      "Returns one avatar profile by id (including trashed ones). CR-25: the primary image entry also carries thumb_url (server-generated WebP thumbnail, max 768px) alongside the original url; all other fields are the full stored profile.",
     request: z.object({ id: z.string().min(1) }),
     response: z.object({ profile: profileOutSchema }),
+    privileged: [privileged.makeThumbnail],
     async handler(ctx, args) {
       const row = await getRow(ctx, args.id);
       return { profile: await toProfileOut(ctx, row) };
@@ -2685,7 +2902,7 @@ export const Actions = {
       chara_chat_sync_request_id: z.string().nullable(),
       chara_chat_target_slug: z.string().nullable(),
     }),
-    privileged: [privileged.findProfileImportTarget],
+    privileged: [privileged.findProfileImportTarget, privileged.makeThumbnail],
     async handler(ctx, args) {
       const dataIn: ProfileData =
         args.sync_to_chara_chat === undefined
@@ -2696,6 +2913,9 @@ export const Actions = {
       // get a flavor_examples request right away.
       const row = await getRow(ctx, id);
       const data = parseData(row.data);
+      // CR-25: pre-generate the primary image's thumbnail at creation
+      // time (URL-specified images included) so the list opens light.
+      await pregeneratePrimaryThumb(ctx, data);
       await queueFlavorExamplesRequest(ctx, id, row.name, data);
       // CR-17: unprocessed reference videos queue one transcript request.
       const videoRequestId = await queueVideoTranscriptRequest(
@@ -2739,7 +2959,7 @@ export const Actions = {
       duplicate: z.boolean(),
       chara_chat_sync_request_id: z.string().nullable(),
     }),
-    privileged: [privileged.findProfileImportTarget],
+    privileged: [privileged.findProfileImportTarget, privileged.makeThumbnail],
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const existing = await db
@@ -2769,6 +2989,9 @@ export const Actions = {
       // CR-12: same flavor_examples queueing as createProfile.
       const row = await getRow(ctx, id);
       const parsed = parseData(row.data);
+      // CR-25: pre-generate the primary image's thumbnail at
+      // registration time, same as createProfile.
+      await pregeneratePrimaryThumb(ctx, parsed);
       await queueFlavorExamplesRequest(ctx, id, row.name, parsed);
       // CR-17: same video_transcript queueing as createProfile.
       await queueVideoTranscriptRequest(ctx, id, row.name, parsed);
@@ -2841,7 +3064,7 @@ export const Actions = {
       chara_chat_sync_request_id: z.string().nullable(),
       chara_chat_target_slug: z.string().nullable(),
     }),
-    privileged: [privileged.findProfileImportTarget],
+    privileged: [privileged.findProfileImportTarget, privileged.makeThumbnail],
     async handler(
       ctx,
       args,
@@ -3176,6 +3399,14 @@ export const Actions = {
           );
         }
       }
+      // CR-25: pre-generate the (possibly changed) primary image's
+      // thumbnail at save time — URL-specified images included — so
+      // the list never generates on open. Best-effort; skipped for
+      // trashed profiles.
+      if (!row.deletedAt) {
+        const savedRow = await getRow(ctx, args.id);
+        await pregeneratePrimaryThumb(ctx, parseData(savedRow.data));
+      }
       ctx.invalidateQueries();
       return {
         ok: true,
@@ -3312,6 +3543,7 @@ export const Actions = {
       theme_color_candidate: z.string().max(20).nullable().default(null),
     }),
     response: z.object({ image_id: z.string(), url: z.string().nullable() }),
+    privileged: [privileged.makeThumbnail],
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const row = await getRow(ctx, args.profile_id);
@@ -3355,6 +3587,8 @@ export const Actions = {
         .update(schema.profiles)
         .set({ data: JSON.stringify(withPrep), updatedAt: new Date() })
         .where(eq(schema.profiles.id, args.profile_id));
+      // CR-25: pre-generate the new primary image's thumbnail now.
+      await pregeneratePrimaryThumb(ctx, withPrep);
       ctx.invalidateQueries();
       return { image_id: imageId, url: await ctx.blobs.getUrl(key) };
     },
@@ -3370,6 +3604,7 @@ export const Actions = {
       theme_color_candidate: z.string().max(20).nullable().default(null),
     }),
     response: z.object({ image_id: z.string() }),
+    privileged: [privileged.makeThumbnail],
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const row = await getRow(ctx, args.profile_id);
@@ -3409,6 +3644,10 @@ export const Actions = {
         .update(schema.profiles)
         .set({ data: JSON.stringify(withPrep2), updatedAt: new Date() })
         .where(eq(schema.profiles.id, args.profile_id));
+      // CR-25: a URL-specified image gets its thumbnail pre-generated
+      // at registration time (the original URL stays in the profile
+      // JSON untouched — the thumbnail is a separate blob alongside).
+      await pregeneratePrimaryThumb(ctx, withPrep2);
       ctx.invalidateQueries();
       return { image_id: imageId };
     },
@@ -3423,6 +3662,7 @@ export const Actions = {
       theme_color_candidate: z.string().max(20).nullable().default(null),
     }),
     response: z.object({ ok: z.literal(true) }),
+    privileged: [privileged.makeThumbnail],
     async handler(ctx, args): Promise<{ ok: true }> {
       const db = ctx.db<typeof schema>();
       const row = await getRow(ctx, args.profile_id);
@@ -3444,6 +3684,8 @@ export const Actions = {
         .update(schema.profiles)
         .set({ data: JSON.stringify(data), updatedAt: new Date() })
         .where(eq(schema.profiles.id, args.profile_id));
+      // CR-25: pre-generate the new primary image's thumbnail.
+      await pregeneratePrimaryThumb(ctx, data);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -3584,6 +3826,7 @@ export const Actions = {
       phrase: z.string(),
       profile_name: z.string(),
     }),
+    privileged: [privileged.makeThumbnail],
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const row = await getRow(ctx, args.profile_id);
@@ -3598,6 +3841,11 @@ export const Actions = {
         createdAt: now,
         updatedAt: now,
       });
+      // CR-25: pre-generate the switch target's primary-image
+      // thumbnail at switch-request time (URL-specified images
+      // included), so the list/focus view is light right after the
+      // switch. Best-effort — the request above stands either way.
+      await pregeneratePrimaryThumb(ctx, parseData(row.data));
       ctx.invalidateQueries();
       return {
         request_id: id,
@@ -4075,6 +4323,7 @@ export const Actions = {
       reason: z.string().max(1000).nullable().default(null),
     }),
     response: z.object({ ok: z.literal(true) }),
+    privileged: [privileged.makeThumbnail],
     async handler(ctx, args): Promise<{ ok: true }> {
       const db = ctx.db<typeof schema>();
       const rows = await db
@@ -4620,6 +4869,18 @@ export const Actions = {
           }
         }
       }
+      // CR-25: a completed image_generation write-back may have just
+      // changed the profile's primary image — pre-generate its
+      // thumbnail now so the list never has to.
+      if (
+        req.kind === "image_generation" &&
+        args.status === "completed" &&
+        req.profileId
+      ) {
+        const prow = await getRow(ctx, req.profileId).catch(() => null);
+        if (prow && !prow.deletedAt)
+          await pregeneratePrimaryThumb(ctx, parseData(prow.data));
+      }
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -4738,12 +4999,13 @@ export const Actions = {
 
   exportProfile: defineAction({
     description:
-      "Exports a profile as avatar-profile v1.0 JSON text. include_personal defaults to true so a plain export is lossless (call_user_as and avatar_memory included — D-01); pass false explicitly to leave personal fields out (N-04 choice).",
+      "Exports a profile as avatar-profile v1.0 JSON text. include_personal defaults to true so a plain export is lossless (call_user_as and avatar_memory included — D-01); pass false explicitly to leave personal fields out (N-04 choice). CR-25: every image entry keeps its original file / blob_key exactly as stored (for URL-specified images, file IS the original image URL — the chara-chat handover depends on it); the primary image's entry additionally carries thumb_url (the server-generated thumbnail) as extra information — the thumbnail never replaces the original URL.",
     request: z.object({
       id: z.string().min(1),
       include_personal: z.boolean().default(true),
     }),
     response: z.object({ json: z.string(), filename: z.string() }),
+    privileged: [privileged.makeThumbnail],
     async handler(ctx, args) {
       const row = await getRow(ctx, args.id);
       const out = await toProfileOut(ctx, row);
@@ -4759,10 +5021,17 @@ export const Actions = {
         background: out.background,
         images: out.images.map((img) => ({
           id: img.id,
+          // CR-25: the ORIGINAL image reference, always kept verbatim
+          // (the URL itself for URL-specified images) — the handover
+          // to the chara-chat app reads the image from here.
           file: img.file,
           blob_key: img.blob_key,
           is_primary: img.is_primary,
           source: img.source,
+          // CR-25: the thumbnail URL rides along as ADDITIONAL info
+          // only (primary image; null when no thumbnail exists). It
+          // never replaces file / blob_key above.
+          thumb_url: img.thumb_url,
         })),
         image_base: out.image_base,
         call_user_as: args.include_personal ? out.call_user_as : null,
@@ -4897,6 +5166,7 @@ export const Actions = {
       "Imports an avatar-profile JSON text as a new profile (new id; embedded blob images are kept as file references). CR-16: voice.reserved is accepted as false or true on import and normalized to true on save (it is only a reservation flag for a future voice feature); all other validation stays strict.",
     request: z.object({ json: z.string().min(2).max(2_000_000) }),
     response: z.object({ id: z.string(), name: z.string() }),
+    privileged: [privileged.makeThumbnail],
     async handler(ctx, args) {
       let raw: Record<string, unknown>;
       try {
@@ -4972,6 +5242,11 @@ export const Actions = {
       const id = await insertProfile(ctx, name, data, {
         favorite: raw.favorite === true,
       });
+      // CR-25: pre-generate the imported profile's primary-image
+      // thumbnail at import time (URL-specified images included; the
+      // imported JSON's original URLs stay untouched in the profile).
+      const importedRow = await getRow(ctx, id);
+      await pregeneratePrimaryThumb(ctx, parseData(importedRow.data));
       ctx.invalidateQueries();
       return { id, name };
     },

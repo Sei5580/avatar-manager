@@ -25,6 +25,7 @@ definePrivilegedContracts,
 definePrivilegedHandlers,
 z,
 } from "@hatch/space-sdk";
+import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -52,6 +53,37 @@ export const privileged = definePrivilegedContracts({
       // mediator before pushing) or "legacy" (publishes the import
       // interface actions only).
       method: z.enum(["handshake", "legacy"]).nullable(),
+    }),
+  },
+  // CR-25: thumbnail generation for the profile list. The action worker
+  // cannot read blob bytes (ctx.blobs has no read API) and has no image
+  // codec, so resizing lives here on the host: read the stored blob
+  // object (or fetch an external image URL), downscale with Bun.Image
+  // to fit inside max_size × max_size (aspect preserved, never
+  // upscaled), re-encode as WebP, and hand the bytes back base64'd so
+  // the action can store them as a thumbnail blob via ctx.blobs.put.
+  // Every failure is reported as { ok: false } — the caller falls back
+  // to the original image URL, so a failed thumbnail never breaks the
+  // list.
+  makeThumbnail: {
+    request: z.object({
+      // The calling space's own directory (runtime-provided ctx.spaceDir),
+      // under which blobs/objects holds the stored blob bytes.
+      space_dir: z.string().min(1).max(2000),
+      // Stored blob key to thumbnail (avatars/<profile>/<img>), or null
+      // when the source is an external URL instead.
+      blob_key: z.string().max(2000).nullable(),
+      // External http(s) image URL to thumbnail, or null when blob_key
+      // is given.
+      source_url: z.string().max(2000).nullable(),
+      // Maximum width/height of the thumbnail in pixels.
+      max_size: z.number().int().min(16).max(2048),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      data_base64: z.string().nullable(),
+      content_type: z.string().nullable(),
+      reason: z.string().nullable(),
     }),
   },
 });
@@ -137,5 +169,92 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       };
     }
     return { found: false, slug: null, name: null, method: null };
+  },
+
+  async makeThumbnail(args) {
+    const fail = (reason: string) => ({
+      ok: false,
+      data_base64: null,
+      content_type: null,
+      reason,
+    });
+    const MAX_BYTES = 12 * 1024 * 1024;
+    try {
+      let bytes: Buffer | Uint8Array | null = null;
+      if (args.blob_key) {
+        // Blob objects live at blobs/objects/<sha256(key)[0:2]>/<sha256(key)>
+        // (see the runtime's blob client); older stores kept the object
+        // at blobs/objects/<key> directly, so try both.
+        const objectsRoot = join(args.space_dir, "blobs", "objects");
+        const objectId = createHash("sha256")
+          .update(args.blob_key, "utf8")
+          .digest("hex");
+        const candidates = [join(objectsRoot, objectId.slice(0, 2), objectId)];
+        if (!args.blob_key.includes("..")) {
+          candidates.push(join(objectsRoot, args.blob_key));
+        }
+        for (const p of candidates) {
+          try {
+            bytes = await readFile(p);
+            break;
+          } catch {
+            // try the next candidate path
+          }
+        }
+        if (!bytes) return fail("blob object not found");
+      } else if (args.source_url) {
+        let u: URL;
+        try {
+          u = new URL(args.source_url);
+        } catch {
+          return fail("invalid source url");
+        }
+        if (u.protocol !== "http:" && u.protocol !== "https:")
+          return fail("unsupported protocol");
+        const resp = await fetch(u, {
+          signal: AbortSignal.timeout(15000),
+          redirect: "follow",
+        });
+        if (!resp.ok) return fail(`fetch failed: ${resp.status}`);
+        const ct = resp.headers.get("content-type") ?? "";
+        if (ct && !ct.startsWith("image/")) return fail("not an image");
+        const buf = new Uint8Array(await resp.arrayBuffer());
+        if (buf.length > MAX_BYTES) return fail("source too large");
+        bytes = buf;
+      } else {
+        return fail("no source");
+      }
+      if (bytes.length > MAX_BYTES) return fail("source too large");
+      const img = new Bun.Image(bytes);
+      const meta = await img.metadata();
+      // An animated GIF would lose its animation as a still WebP; the
+      // caller falls back to the original for those.
+      if (meta.format === "gif") return fail("gif not thumbnailed");
+      const maxDim = Math.max(meta.width, meta.height);
+      if (maxDim <= args.max_size && meta.format === "webp") {
+        // Already a small WebP: store it as its own thumbnail.
+        return {
+          ok: true,
+          data_base64: Buffer.from(bytes).toString("base64"),
+          content_type: "image/webp",
+          reason: null,
+        };
+      }
+      const pipeline =
+        maxDim > args.max_size
+          ? img.resize(args.max_size, args.max_size, { fit: "inside" })
+          : img;
+      const out = await pipeline.webp({ quality: 80 }).bytes();
+      return {
+        ok: true,
+        data_base64: Buffer.from(out).toString("base64"),
+        content_type: "image/webp",
+        reason: null,
+      };
+    } catch (e) {
+      return fail(
+        e instanceof Error ? e.message.slice(0, 200) : "thumbnail failed",
+      );
+    }
   },
 });
