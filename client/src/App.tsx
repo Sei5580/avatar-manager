@@ -599,6 +599,13 @@ function formToData(f: FormState, existing?: Profile) {
     },
     origin: existing?.origin ?? { type: "app" as const, chat_link: null },
     candidate_id: existing?.candidate_id ?? null,
+    // CR-24: the 「キャラチャットに反映する」 preference and the last
+    // reflection time are managed outside the form (the checkbox state
+    // travels as the save call's sync_to_chara_chat argument, and the
+    // synced-at stamp is written only by sync write-backs) — carried
+    // through from the stored profile untouched.
+    chara_chat_sync: existing?.chara_chat_sync ?? null,
+    chara_chat_synced_at: existing?.chara_chat_synced_at ?? null,
   };
 }
 
@@ -720,6 +727,8 @@ function genKindLabel(kind: GenRequest["kind"]): string {
       return "例文の自動作成";
     case "video_transcript":
       return "参考動画の文字起こし";
+    case "chara_chat_sync":
+      return "キャラチャットへ反映";
     default:
       return "試し会話";
   }
@@ -3075,6 +3084,97 @@ function ListView({ navigate }: { navigate: (v: View) => void }) {
 // Create wizard
 // ---------------------------------------------------------------------------
 
+// CR-24: 「キャラチャットに反映する」 checkbox for the create/edit
+// forms. The reflection destination is discovered by the server under
+// the receiver interop contract (a getAvatarReceiverInfo
+// self-introduction, or the legacy import interface) — never a fixed
+// app. While the status is loading the checkbox stays off and
+// disabled; when a target exists it is auto-checked (the caller
+// computes the effective checked state) and shows 「自動反映可能」;
+// when none exists it stays off and disabled with 「自動反映不可」,
+// and saving is completely unaffected.
+type CharaSyncStatus = {
+  available: boolean;
+  target_slug: string | null;
+  target_name: string | null;
+  discovery_method: "handshake" | "legacy" | null;
+};
+
+function CharaChatSyncField({
+  status,
+  checked,
+  onChange,
+  lastSyncedAt,
+}: {
+  status: CharaSyncStatus | undefined;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  lastSyncedAt?: string | null;
+}) {
+  const loading = status === undefined;
+  const available = !!status?.available;
+  const targetLabel = status?.target_name ?? status?.target_slug ?? null;
+  return (
+    <fieldset
+      className="rounded-xl p-3"
+      style={{ border: "1.5px solid var(--teal)", background: "var(--surface)" }}
+    >
+      <legend className="font-display px-1 text-base font-bold">
+        キャラチャット連携
+      </legend>
+      <label className="flex min-h-9 items-center gap-2 text-sm font-semibold">
+        <input
+          type="checkbox"
+          aria-label="キャラチャットに反映する"
+          className="h-5 w-5 shrink-0"
+          checked={available && checked}
+          disabled={!available}
+          onChange={(e) => onChange(e.target.checked)}
+        />
+        キャラチャットに反映する
+        {loading ? (
+          <span
+            className="rounded-full px-2 py-0.5 text-xs font-bold"
+            style={{ border: "1.5px solid var(--border)", color: "var(--dim)" }}
+          >
+            連携先を確認中…
+          </span>
+        ) : available ? (
+          <span
+            className="rounded-full px-2 py-0.5 text-xs font-bold text-white"
+            style={{ background: "var(--teal)" }}
+          >
+            自動反映可能
+          </span>
+        ) : (
+          <span
+            className="rounded-full px-2 py-0.5 text-xs font-bold"
+            style={{ border: "1.5px solid var(--accent)", color: "var(--accent)" }}
+          >
+            自動反映不可
+          </span>
+        )}
+      </label>
+      {loading ? (
+        <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>
+          連携できるアプリがあるか確認しています。
+        </p>
+      ) : available ? (
+        <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+          連携先アプリ{targetLabel ? `「${targetLabel}」` : ""}が見つかりました。オンのまま保存すると、保存と同時にこのプロファイルの反映リクエストが自動で作成され、連携先へ取り込まれます（変更がなければスキップされます）。
+          {lastSyncedAt
+            ? ` 前回の反映: ${fmtDate(lastSyncedAt)}`
+            : " まだ反映されたことはありません。"}
+        </p>
+      ) : (
+        <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+          プロファイルの受け口（自己紹介 getAvatarReceiverInfo、または取り込み用インターフェース）を持つアプリがこの環境で見つからないため、自動反映は利用できません。保存や他の機能には影響しません。
+        </p>
+      )}
+    </fieldset>
+  );
+}
+
 function CreateView({ navigate }: { navigate: (v: View) => void }) {
   const queryClient = useQueryClient();
   const [form, setForm] = useState<FormState>(emptyForm());
@@ -3089,6 +3189,16 @@ function CreateView({ navigate }: { navigate: (v: View) => void }) {
   const [nameError, setNameError] = useState("");
   const [saveError, setSaveError] = useState("");
   const [saving, setSaving] = useState(false);
+  // CR-24: chara-chat auto-sync. The status query asks the server
+  // whether a receiver app was discovered in this environment; the
+  // checkbox follows availability (auto-checked) until the user
+  // explicitly toggles it (syncOverride).
+  const charaStatus = useQuery({
+    queryKey: ["chara-sync-status"],
+    queryFn: () => api.getCharaChatSyncStatus({}),
+  });
+  const [syncOverride, setSyncOverride] = useState<boolean | null>(null);
+  const syncChecked = syncOverride ?? charaStatus.data?.available ?? false;
 
   // CR-10: live theme-color acquisition while creating. When a base
   // image is chosen (upload preview or a readable URL), its dominant
@@ -3177,7 +3287,7 @@ function CreateView({ navigate }: { navigate: (v: View) => void }) {
         video: form.bgVideoUrls.some((l) => l.trim()) ? "pending" : "none",
         status: "preparing",
       };
-      const created = await api.createProfile({ name: form.name.trim(), data, favorite: form.favorite });
+      const created = await api.createProfile({ name: form.name.trim(), data, favorite: form.favorite, sync_to_chara_chat: syncChecked });
       const id = created.id;
       if (effectiveImageMode === "upload" && pendingUpload) {
         await api.uploadImage({
@@ -3391,8 +3501,15 @@ function CreateView({ navigate }: { navigate: (v: View) => void }) {
         <section aria-label="確認" className="space-y-2 rounded-xl p-4 text-sm" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
           <h3 className="font-display text-base font-bold">確認</h3>
           <p>名前: {form.name || "（未入力）"} ／ 参考リンク: {form.bgLinks.filter((l) => l.trim()).length}件 ／ 参考動画: {form.bgVideoUrls.filter((l) => l.trim()).length}件 ／ 画像: {imageMode === "upload" ? (pendingUpload ? "アップロード済み" : "未選択") : imageMode === "url" ? (imageUrl ? `URL: ${imageUrl}` : "URL未入力（画像なし扱い）") : imageMode === "elements" ? "要素指定" : "画像なし"}</p>
-          <p className="text-xs" style={{ color: "var(--dim)" }}>保存時に自動で積まれるリクエスト: 挨拶文（常時）{form.bgLinks.some((l) => l.trim()) ? "、参考リンク要約" : ""}{form.bgVideoUrls.some((l) => l.trim()) ? "、参考動画の文字起こし" : ""}{imageMode === "elements" ? "、画像生成" : ""}</p>
+          <p className="text-xs" style={{ color: "var(--dim)" }}>保存時に自動で積まれるリクエスト: 挨拶文（常時）{form.bgLinks.some((l) => l.trim()) ? "、参考リンク要約" : ""}{form.bgVideoUrls.some((l) => l.trim()) ? "、参考動画の文字起こし" : ""}{imageMode === "elements" ? "、画像生成" : ""}{syncChecked && charaStatus.data?.available ? "、キャラチャットへ反映" : ""}</p>
         </section>
+
+        {/* CR-24: キャラチャットに反映する */}
+        <CharaChatSyncField
+          status={charaStatus.data}
+          checked={syncChecked}
+          onChange={(v) => setSyncOverride(v)}
+        />
 
         {saveError && <p className="text-sm" style={{ color: "var(--accent)" }}>{saveError}</p>}
         <div className="flex flex-wrap gap-2">
@@ -3439,6 +3556,20 @@ function DetailView({
   const [urlInput, setUrlInput] = useState("");
   const [showOptionalDetail, setShowOptionalDetail] = useState(false);
   const [memoryChoice, setMemoryChoice] = useState<"keep" | "reset" | "duplicate">("keep");
+  // CR-24: chara-chat auto-sync. The checkbox state follows, in order:
+  // the user's explicit toggle in this session, the profile's stored
+  // preference, then availability (auto-checked when a receiver app is
+  // discovered in this environment).
+  const charaStatus = useQuery({
+    queryKey: ["chara-sync-status"],
+    queryFn: () => api.getCharaChatSyncStatus({}),
+  });
+  const [syncOverride, setSyncOverride] = useState<boolean | null>(null);
+  const syncChecked =
+    syncOverride ??
+    profile?.chara_chat_sync ??
+    charaStatus.data?.available ??
+    false;
   // CR-13: anchor for the phrase shown under the save buttons; used to
   // gently scroll it into view right after it appears.
   const savePhraseRef = useRef<HTMLDivElement | null>(null);
@@ -3509,12 +3640,14 @@ function DetailView({
           name: `${form.name.trim()} のコピー`,
           data,
           favorite: form.favorite,
+          sync_to_chara_chat: syncChecked,
         });
         return {
           duplicatedTo: created.id,
           linkRequeued: false,
           flavorExamplesQueued: false,
           videoQueued: false,
+          charaSyncQueued: !!created.chara_chat_sync_request_id,
           applyKind: null as "profile_apply" | "switch" | null,
           applyPhrase: null as string | null,
         };
@@ -3581,6 +3714,7 @@ function DetailView({
         change_label: bigChange ? "名前・設定の変更" : "編集",
         allow_clear: allowClear,
         apply_now: applyNow,
+        sync_to_chara_chat: syncChecked,
       });
       return {
         duplicatedTo: null as string | null,
@@ -3589,6 +3723,8 @@ function DetailView({
         flavorExamplesQueued: !!updated.flavor_examples_request_id,
         // CR-17: a video_transcript request was queued/refreshed by this save.
         videoQueued: !!updated.video_transcript_request_id,
+        // CR-24: a chara_chat_sync request was queued/refreshed by this save.
+        charaSyncQueued: !!updated.chara_chat_sync_request_id,
         applyKind: updated.apply_kind,
         applyPhrase: updated.apply_phrase,
       };
@@ -3627,6 +3763,9 @@ function DetailView({
             : "") +
           (r.videoQueued
             ? " 未処理の参考動画について、文字起こしの取得を依頼しました（準備中：参考動画）。"
+            : "") +
+          (r.charaSyncQueued
+            ? " キャラチャットへの反映リクエストを作成しました（連携先へ自動で取り込まれます）。"
             : ""),
       );
       setForm(null);
@@ -3667,7 +3806,7 @@ function DetailView({
   });
 
   const genMut = useMutation({
-    mutationFn: async (args: { kind: "image_generation" | "link_summary" | "trial_conversation" | "video_transcript"; payload: string }) =>
+    mutationFn: async (args: { kind: "image_generation" | "link_summary" | "trial_conversation" | "video_transcript" | "chara_chat_sync"; payload: string }) =>
       await api.createGenerationRequest({ profile_id: id, kind: args.kind, payload: args.payload }),
     onSuccess: () => invalidateAll(),
     onError: (e) =>
@@ -4416,6 +4555,22 @@ function DetailView({
             >
               参考動画の文字起こしを依頼
             </button>
+            <button
+              type="button"
+              aria-label="キャラチャットへ反映を依頼"
+              className="rounded-lg px-3 py-2 text-sm font-semibold"
+              style={{ border: "1px solid var(--border)" }}
+              disabled={genMut.isPending || !charaStatus.data?.available}
+              title={charaStatus.data?.available ? undefined : "連携先アプリが見つからないため利用できません"}
+              onClick={() =>
+                genMut.mutate({
+                  kind: "chara_chat_sync",
+                  payload: JSON.stringify({}),
+                })
+              }
+            >
+              キャラチャットへ反映を依頼
+            </button>
           </div>
 
           <fieldset className="mt-4">
@@ -4443,6 +4598,16 @@ function DetailView({
               ))}
             </div>
           </fieldset>
+
+          {/* CR-24: キャラチャットに反映する */}
+          <div className="mt-4">
+            <CharaChatSyncField
+              status={charaStatus.data}
+              checked={syncChecked}
+              onChange={(v) => setSyncOverride(v)}
+              lastSyncedAt={profile.chara_chat_synced_at}
+            />
+          </div>
 
           <div className="mt-4 flex flex-wrap gap-2">
             <button

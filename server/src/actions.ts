@@ -10,6 +10,10 @@
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
 import { and, desc, eq, isNull } from "drizzle-orm";
 import * as schema from "./schema";
+// CR-24: host-side discovery of the chara-chat import target (see
+// server/src/privileged.ts). The descriptor module is generated from
+// privileged.ts at build time.
+import { privileged } from "@space/privileged";
 
 // ---------------------------------------------------------------------------
 // Shared shapes
@@ -414,6 +418,18 @@ const profileDataSchema = z.object({
     chat_link: z.string().max(2000).nullable().default(null),
   }),
   candidate_id: z.string().max(500).nullable().default(null),
+  // CR-24: 「キャラチャットに反映する」 — the user's stored choice for
+  // auto-reflecting this profile into the chara-chat app (the one
+  // discovered in this environment by its import interface) whenever
+  // the profile is created/updated with the checkbox on. true/false
+  // once the user has saved with an explicit checkbox state; null =
+  // never chosen (the form then follows availability: auto-checked
+  // when a target app exists). Legacy profiles parse with null.
+  chara_chat_sync: z.boolean().nullable().default(null),
+  // CR-24: when the last chara_chat_sync request for this profile
+  // completed (ISO string), written ONLY by that kind's write-back.
+  // Null = never reflected yet.
+  chara_chat_synced_at: z.string().max(100).nullable().default(null),
 });
 
 type ProfileData = z.infer<typeof profileDataSchema>;
@@ -422,6 +438,13 @@ const profileInputSchema = z.object({
   name: z.string().trim().min(1).max(100),
   data: profileDataSchema,
   favorite: z.boolean().default(false),
+  // CR-24: the create/edit form's 「キャラチャットに反映する」 checkbox.
+  // When true, the save also queues a chara_chat_sync request for the
+  // profile (and kicks the mediator) — but only if an import target is
+  // actually discovered in this environment; when false/absent nothing
+  // is queued. Either way the value is stored as the profile's
+  // chara_chat_sync preference.
+  sync_to_chara_chat: z.boolean().optional(),
 });
 
 type PreparationItem = z.infer<typeof preparationItemSchema>;
@@ -2048,6 +2071,17 @@ function mergePreservingManagedFields(
   if (!out.candidate_id && before.candidate_id) {
     out.candidate_id = before.candidate_id;
   }
+  // CR-24: chara_chat_synced_at is written only by chara_chat_sync
+  // write-backs (completeGenerationRequest) — a form or stub payload
+  // never changes it, so the stored value always wins here.
+  out.chara_chat_synced_at = before.chara_chat_synced_at;
+  // CR-24: the 「キャラチャットに反映する」 preference survives payloads
+  // that leave it unset (null — e.g. an agent-side rename-only stub
+  // whose data carries only schema defaults). updateProfile's explicit
+  // sync_to_chara_chat argument is applied AFTER this merge and wins.
+  if (out.chara_chat_sync === null && before.chara_chat_sync !== null) {
+    out.chara_chat_sync = before.chara_chat_sync;
+  }
   return out;
 }
 
@@ -2075,6 +2109,10 @@ const profileOutSchema = z.object({
   switch_settings: profileDataSchema.shape.switch_settings,
   origin: profileDataSchema.shape.origin,
   candidate_id: z.string().nullable(),
+  // CR-24: the stored 「キャラチャットに反映する」 preference (null =
+  // never chosen) and the last completed reflection time (null = never).
+  chara_chat_sync: z.boolean().nullable(),
+  chara_chat_synced_at: z.string().nullable(),
   favorite: z.boolean(),
   is_active: z.boolean(),
   is_default: z.boolean(),
@@ -2186,6 +2224,8 @@ async function toProfileOut(
     },
     origin: data.origin,
     candidate_id: data.candidate_id,
+    chara_chat_sync: data.chara_chat_sync ?? null,
+    chara_chat_synced_at: data.chara_chat_synced_at ?? null,
     favorite: row.favorite,
     is_active: row.isActive,
     is_default: row.isDefault,
@@ -2345,6 +2385,7 @@ const generationRequestOut = z.object({
     "profile_apply",
     "flavor_examples",
     "video_transcript",
+    "chara_chat_sync",
   ]),
   payload: z.string(),
   status: z.enum(["pending", "processing", "completed", "failed"]),
@@ -2388,6 +2429,157 @@ async function toGenOut(
     created_at: row.createdAt.toISOString(),
     updated_at: row.updatedAt.toISOString(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// CR-24: キャラチャットへの自動反映 (chara_chat_sync requests)
+// ---------------------------------------------------------------------------
+//
+// The reflection destination is NEVER a fixed app: it is discovered by
+// function, following the receiver-side interop contract —
+//   primary: an app publishing the self-introduction action
+//     getAvatarReceiverInfo; the mediator verifies its response
+//     (protocol "avatar-profile-receiver", protocol_version 1)
+//     immediately before pushing and pushes to the push_action the
+//     response names.
+//   fallback: an older receiver without the self-introduction, i.e. an
+//     app publishing ALL of the import interface actions below; the
+//     push then goes to importCharactersBulk directly.
+// Neither judgment uses a slug, space id, or app name. The scan itself
+// runs host-side (privileged.ts) because the action worker cannot read
+// the environment's space directories; any scan failure is treated as
+// "no target", which only disables auto-sync — saving and every other
+// feature are unaffected.
+const CHARA_RECEIVER_HANDSHAKE_ACTION = "getAvatarReceiverInfo";
+const CHARA_RECEIVER_PROTOCOL = "avatar-profile-receiver";
+const CHARA_RECEIVER_PROTOCOL_VERSION = 1;
+const CHARA_IMPORT_REQUIRED_ACTIONS = [
+  "importCharactersBulk",
+  "getImportStates",
+  "getImportStatus",
+] as const;
+
+type CharaImportTarget = {
+  slug: string;
+  name: string | null;
+  method: "handshake" | "legacy";
+};
+
+async function discoverCharaImportTarget(
+  ctx: Ctx,
+): Promise<CharaImportTarget | null> {
+  try {
+    const res = await ctx.executePrivileged(
+      privileged.findProfileImportTarget,
+      {
+        self_slug: ctx.slug,
+        handshake_action: CHARA_RECEIVER_HANDSHAKE_ACTION,
+        required_actions: [...CHARA_IMPORT_REQUIRED_ACTIONS],
+      },
+    );
+    if (res.found && res.slug && res.method)
+      return { slug: res.slug, name: res.name, method: res.method };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// The push procedure the mediator follows, written once for the
+// request payload note and the kick message. Everything environment-
+// specific in it (both slugs, the target name) comes from runtime
+// values — the discovered target and this app's own ctx.slug.
+function charaSyncProcedure(
+  sourceSlug: string,
+  target: CharaImportTarget,
+  profileId: string,
+  requestId: string,
+): string {
+  const handshake =
+    target.method === "handshake"
+      ? `(0) 連携先アプリ（スペース slug: ${target.slug}）の ${CHARA_RECEIVER_HANDSHAKE_ACTION} を呼び、応答の protocol が "${CHARA_RECEIVER_PROTOCOL}" で protocol_version が ${CHARA_RECEIVER_PROTOCOL_VERSION} であることを確認する。違う場合は反映を中止し、手順(3)で status: failed としてその旨を理由に書き戻すこと。push 先は応答の push_action が示すアクション名を使う。`
+      : `(0) 連携先は自己紹介アクションを持たない旧方式のため、push 先は importCharactersBulk を使う。`;
+  return [
+    handshake,
+    `(1) ${sourceSlug} の exportAllProfiles を ids: ["${profileId}"] で呼び、保存されたプロファイル1件分のエントリ（{id, name, updated_at, profile}）を取得する（空なら手順(3)で failed として理由を報告する）。`,
+    `(2) 連携先アプリ（スペース slug: ${target.slug}）の push 先アクションに、手順(1)のエントリ1件だけを profiles 配列に入れて渡す（batch_id: "sync-${requestId}"）。応答には追加・更新・スキップ・失敗の件数が入る。差分判定は連携先のサーバ側が行い、この経路で反映すると連携先の差分取り込み記録（source_updated_at）も更新されるので、後から一括取り込みを実行してもこのプロファイルは「変更なし」としてスキップされる。`,
+    `(3) ${sourceSlug} の completeGenerationRequest を request_id: "${requestId}" で呼び、結果を書き戻す。対象プロファイルが追加・更新・スキップのいずれかなら status: "completed" で push 応答のJSONを result に入れ、対象プロファイルが失敗（failed）なら status: "failed" で項目ごとの理由を reason に入れる。`,
+    `画像の取得・保存は連携先のサーバが行います。画像をダウンロードしたり base64 化したりしないでください。`,
+  ].join(" ");
+}
+
+// Queue (or refresh) the profile's single open chara_chat_sync request
+// and kick the mediator agent right away (the same spawn pattern the
+// chara-chat side uses for its import kick). The request row is the
+// durable record: if the kick fails or no agent picks it up, the
+// request stays pending for the chat-side agent's polling, exactly
+// like every other generation request in this app. The mediator is
+// told the DISCOVERED target slug (never a constant) and writes the
+// outcome back through completeGenerationRequest.
+async function queueCharaChatSyncRequest(
+  ctx: Ctx,
+  profileId: string,
+  profileName: string,
+  profileUpdatedAt: string,
+  target: CharaImportTarget,
+): Promise<string> {
+  const db = ctx.db<typeof schema>();
+  const open = await db
+    .select()
+    .from(schema.generationRequests)
+    .where(
+      and(
+        eq(schema.generationRequests.profileId, profileId),
+        eq(schema.generationRequests.kind, "chara_chat_sync"),
+      ),
+    );
+  const existing = open.find(
+    (r) => r.status === "pending" || r.status === "processing",
+  );
+  const now = new Date();
+  const requestId = existing ? existing.id : newId("gen");
+  const payload = JSON.stringify({
+    profile_id: profileId,
+    name: profileName,
+    profile_updated_at: profileUpdatedAt,
+    source_slug: ctx.slug,
+    target_slug: target.slug,
+    target_name: target.name,
+    target_method: target.method,
+    note: charaSyncProcedure(ctx.slug, target, profileId, requestId),
+  });
+  if (existing) {
+    await db
+      .update(schema.generationRequests)
+      .set({ payload, updatedAt: now })
+      .where(eq(schema.generationRequests.id, existing.id));
+  } else {
+    await db.insert(schema.generationRequests).values({
+      id: requestId,
+      profileId,
+      kind: "chara_chat_sync",
+      payload,
+      status: "pending",
+      result: null,
+      reason: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+  // Kick the mediator immediately. A failed kick is not an error: the
+  // queued request remains for the polling safety net.
+  try {
+    await ctx.agent.spawnTask(
+      `アバター総合管理アプリ（スペース slug: ${ctx.slug}）で、プロファイル「${profileName}」（profile_id: ${profileId}）のキャラチャット反映リクエスト（request_id: ${requestId}）が作成されました。連携先アプリ（スペース slug: ${target.slug}）へ反映を処理してください。${charaSyncProcedure(ctx.slug, target, profileId, requestId)}`,
+      {
+        dedupeKey: `chara-chat-sync-${profileId}`,
+        expectsAction: "completeGenerationRequest",
+      },
+    );
+  } catch {
+    // The request row above is the durable record; ignore kick errors.
+  }
+  return requestId;
 }
 
 async function insertProfile(
@@ -2483,14 +2675,23 @@ export const Actions = {
 
   createProfile: defineAction({
     description:
-      "Creates a new avatar profile from the create/edit form input and returns its id. CR-10: data.theme_color / theme_color_source carry the theme color — auto (acquired from the representative image's dominant color or inferred from the appearance elements), manual (user-picked, never auto-overwritten), or default (fallback color). CR-12: if any flavor trait has auto_examples on and no examples yet, a flavor_examples generation request is queued for the new profile (see updateProfile). CR-17: if the profile carries 参考動画URL (background.video_urls) that no transcript attempt has covered yet, exactly one video_transcript generation request is queued for it (payload: the video URLs plus name / background summary / current speech as context) and its id is returned as video_transcript_request_id.",
+      "Creates a new avatar profile from the create/edit form input and returns its id. CR-10: data.theme_color / theme_color_source carry the theme color — auto (acquired from the representative image's dominant color or inferred from the appearance elements), manual (user-picked, never auto-overwritten), or default (fallback color). CR-12: if any flavor trait has auto_examples on and no examples yet, a flavor_examples generation request is queued for the new profile (see updateProfile). CR-17: if the profile carries 参考動画URL (background.video_urls) that no transcript attempt has covered yet, exactly one video_transcript generation request is queued for it (payload: the video URLs plus name / background summary / current speech as context) and its id is returned as video_transcript_request_id. CR-24: with sync_to_chara_chat=true (the form's 「キャラチャットに反映する」 checkbox), the value is stored as the profile's chara_chat_sync preference and — only when a receiver app is discovered in this environment under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction, whose protocol response the mediator verifies before pushing; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus) — exactly one chara_chat_sync request is queued for the new profile (mediator kicked immediately; payload carries the DISCOVERED target slug) and its id / the target slug are returned as chara_chat_sync_request_id / chara_chat_target_slug. When no target is discovered, nothing is queued and both fields are null; creation itself is unaffected.",
     request: profileInputSchema,
     response: z.object({
       id: z.string(),
       video_transcript_request_id: z.string().nullable(),
+      // CR-24: the chara_chat_sync request this creation queued (null
+      // when the checkbox was off or no import target was discovered).
+      chara_chat_sync_request_id: z.string().nullable(),
+      chara_chat_target_slug: z.string().nullable(),
     }),
+    privileged: [privileged.findProfileImportTarget],
     async handler(ctx, args) {
-      const id = await insertProfile(ctx, args.name, args.data, { favorite: args.favorite });
+      const dataIn: ProfileData =
+        args.sync_to_chara_chat === undefined
+          ? args.data
+          : { ...args.data, chara_chat_sync: args.sync_to_chara_chat };
+      const id = await insertProfile(ctx, args.name, dataIn, { favorite: args.favorite });
       // CR-12: traits saved with 「例文を自動作成」 on and no examples
       // get a flavor_examples request right away.
       const row = await getRow(ctx, id);
@@ -2503,16 +2704,42 @@ export const Actions = {
         row.name,
         data,
       );
+      // CR-24: reflect into the discovered chara-chat app right away.
+      let charaSyncRequestId: string | null = null;
+      let charaTargetSlug: string | null = null;
+      if (args.sync_to_chara_chat) {
+        const target = await discoverCharaImportTarget(ctx);
+        if (target) {
+          charaTargetSlug = target.slug;
+          charaSyncRequestId = await queueCharaChatSyncRequest(
+            ctx,
+            id,
+            row.name,
+            row.updatedAt.toISOString(),
+            target,
+          );
+        }
+      }
       ctx.invalidateQueries();
-      return { id, video_transcript_request_id: videoRequestId };
+      return {
+        id,
+        video_transcript_request_id: videoRequestId,
+        chara_chat_sync_request_id: charaSyncRequestId,
+        chara_chat_target_slug: charaTargetSlug,
+      };
     },
   }),
 
   registerProfile: defineAction({
     description:
-      "Registers a profile made outside this app (auto-save path for the chat agent). If a non-deleted profile with the same name already exists, returns duplicate:true with the existing id instead of creating a copy.",
+      "Registers a profile made outside this app (auto-save path for the chat agent). If a non-deleted profile with the same name already exists, returns duplicate:true with the existing id instead of creating a copy. CR-24: sync_to_chara_chat behaves as in createProfile (stored as the chara_chat_sync preference; a chara_chat_sync request is queued only for a newly registered profile and only when an import target is discovered).",
     request: profileInputSchema,
-    response: z.object({ id: z.string(), duplicate: z.boolean() }),
+    response: z.object({
+      id: z.string(),
+      duplicate: z.boolean(),
+      chara_chat_sync_request_id: z.string().nullable(),
+    }),
+    privileged: [privileged.findProfileImportTarget],
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const existing = await db
@@ -2525,9 +2752,17 @@ export const Actions = {
           ),
         )
         .limit(1);
-      if (existing[0]) return { id: existing[0].id, duplicate: true };
+      if (existing[0])
+        return {
+          id: existing[0].id,
+          duplicate: true,
+          chara_chat_sync_request_id: null,
+        };
       const data: ProfileData = {
         ...args.data,
+        ...(args.sync_to_chara_chat === undefined
+          ? {}
+          : { chara_chat_sync: args.sync_to_chara_chat }),
         origin: { ...args.data.origin, type: "auto_saved" },
       };
       const id = await insertProfile(ctx, args.name, data);
@@ -2537,14 +2772,28 @@ export const Actions = {
       await queueFlavorExamplesRequest(ctx, id, row.name, parsed);
       // CR-17: same video_transcript queueing as createProfile.
       await queueVideoTranscriptRequest(ctx, id, row.name, parsed);
+      // CR-24: same chara_chat_sync queueing as createProfile.
+      let charaSyncRequestId: string | null = null;
+      if (args.sync_to_chara_chat) {
+        const target = await discoverCharaImportTarget(ctx);
+        if (target) {
+          charaSyncRequestId = await queueCharaChatSyncRequest(
+            ctx,
+            id,
+            row.name,
+            row.updatedAt.toISOString(),
+            target,
+          );
+        }
+      }
       ctx.invalidateQueries();
-      return { id, duplicate: false };
+      return { id, duplicate: false, chara_chat_sync_request_id: charaSyncRequestId };
     },
   }),
 
   updateProfile: defineAction({
     description:
-      "Partially updates a profile's editable fields, first saving the previous version into its history (latest 20 kept). Fields the payload leaves empty keep their stored values (D-02): images, greeting, link_summary, avatar_memory, candidate_id, summary, background text/links, call_user_as, speech style, voice kind/speed, and the whole image_base (type, image_ref, and all 13 elements — a default-stub image_base never overwrites a stored one). List a field in allow_clear to clear it intentionally (\"image_base\" / \"elements\" / \"elements:<key>\" / \"image_ref\" address the image base). If background.links were added or changed and are non-empty, a link_summary regeneration request is queued automatically and preparation returns to pending; link_summary_requeued in the response reports whether that happened. CR-03: with apply_now=true the save also queues exactly one immediate-apply request — a profile_apply generation request (payload: image_ref, primary image, name, speech style, call_user_as) when the profile is active, or a normal switch request when it is not; apply_kind/apply_request_id in the response report which. apply_now=false (default) is save-only. CR-04: apply_phrase carries the canned phrase for that request (paste it into chat to trigger it). CR-06: speech carries structured fields (structured.first_person/second_person/catchphrase/memo plus top-level call_user_as and speech.style) with per-field sources (speech.sources: auto/manual/null); values changed through this action become manual and are protected from generation write-backs, empty speech fields keep stored values unless listed in allow_clear (speech_first_person / speech_second_person / speech_catchphrase / speech_memo), and the profile_apply payload includes the merged speech fields (speech / speech_structured / speech_sources). CR-07: background.user_relationship is the optional 「私の扱い」 (what the user is to this character — master, friend, …); it is preserved on empty like the other background fields (allow_clear: \"user_relationship\" clears it intentionally), is carried in the auto link_summary requeue payload and in the profile_apply payload (user_relationship / background_user_relationship), and switch requests expose it on their output for the chat side. CR-08: data.flavor is the フレーバー設定 {level 0-5 (default 3), traits[{id, label, examples[], scenes[], enabled, source auto/manual}]}; traits added/changed through this action become manual (protected from generation write-backs), an empty traits payload keeps the stored flavor unless allow_clear lists \"flavor_traits\", and the profile_apply payload includes the merged flavor (flavor / flavor_level / flavor_traits / flavor_enabled_traits: level + enabled traits only). CR-10: data carries theme_color (#rrggbb) + theme_color_source (auto/manual/default); a manual theme color is never overwritten by automatic acquisition or stub payloads (list \"theme_color\" in allow_clear when the user changed it or returned it to automatic on purpose), and a still-default profile is initialized from its appearance elements on read. CR-14: each flavor trait also carries frequency (0-5 or null; null = follow the global level, a number overrides it for that trait only, same stage meanings as the global bar). Switch output, profile_apply payloads, and generation payloads carry per-trait effective_frequency (frequency ?? level) and frequency_is_custom; a trait with effective_frequency 0 is handed over with 0 explicitly and must be treated like a disabled trait (never shown). Legacy traits parse with frequency null, so existing profiles behave exactly as before. CR-12: each flavor trait carries auto_examples (「例文を自動作成」); when a save leaves any trait with auto_examples on and no examples, a flavor_examples generation request is queued for the profile (an already-open one is refreshed with the current targets instead of duplicated) and its id is returned as flavor_examples_request_id. The request payload carries the target traits (id/label/scenes) plus speech, summary, background summary, and user_relationship as context. CR-17: background carries video_urls (参考動画URL, kept separate from links), video_notes (tone findings from the videos' dialogue), unreadable_videos, and video_processed_urls; video_urls are preserved on empty like links (allow_clear: \"video_urls\" clears them intentionally) and the generation-managed video fields survive stub payloads. When a save leaves any video URL no transcript attempt has covered, exactly one video_transcript generation request is queued or refreshed for the profile and its id is returned as video_transcript_request_id; the profile_apply payload and the auto link_summary requeue carry video_notes as tone reference material. CR-23: video_urls may include YouTube playlist URLs (youtube.com/playlist?list=…); they are stored and queued like any other video URL, and the video_transcript payload flags them (playlist_urls + playlist_note) so the chat side transcribes every video in the list. CR-19: background.portrayal_focus is the optional 「演じる姿・状況」 (a specific portrayal/situation to bias toward — 中学生の時のみ / 闇落ちした状態 / もしものif設定 etc.); it is preserved on empty like user_relationship (allow_clear: \"portrayal_focus\" clears it intentionally). Only when set: generation payloads carry portrayal_focus + portrayal_focus_note (use ONLY the material matching that portrayal/situation; for videos pick the matching chapters/segments; if nothing matches, report that in the write-back instead of filling from other states), and the profile_apply payload carries it with the acting premise (respond in that portrayal/situation). When empty, no portrayal keys or bias instructions appear anywhere and behavior is exactly as before. CR-20: when portrayal_focus actually changes in a save (set, changed, or cleared), re-inference is queued under the new bias — a link_summary request is re-queued when the profile has background links, and a video_transcript request is re-queued with force (already-processed videos included) when it has reference videos; a save that leaves the value unchanged queues neither for this reason. CR-21: background also carries the portrayal check state (portrayal_focus_status: unknown/ok/failed, portrayal_focus_failure_reason, portrayal_focus_checks {link_summary, video_transcript: match/no_match/null}) — it is generation-managed (write-backs and this action's reset are the only writers; payloads cannot set it). When portrayal_focus actually changes, the state resets to unknown with no checks and no reason, and the CR-20 re-queue re-judges it. While the state is failed, the bias is inactive: the profile_apply payload built here carries no portrayal keys, exactly like an unused field. CR-21 addendum: CLEARING portrayal_focus (empty value + allow_clear) counts as a change exactly like setting/editing it — including while the state is failed, the reset and the re-queue (link_summary when links exist, video_transcript with force when videos exist) always fire together, so the full-material write-backs that follow restore link_summary / video_notes to normal content and the failed state/badge clears. CR-21 addendum 2: the set → cleared transition is additionally a repair trigger for avatar_memory — the re-queue payloads fired by that save (link_summary and/or video_transcript) carry the current avatar_memory with avatar_memory_repair: true and an instruction to remove any elements written into the memory because of the removed specification (keeping all other facts) and return the repaired text as the write-back's avatar_memory. A save where portrayal_focus does not actually change fires no re-queue and no memory repair, and profiles that never had a focus are completely unaffected. CR-22: the profile_apply payload queued with apply_now=true always carries address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方), for every profile regardless of its call_user_as / second_person settings; it is a handover note only and changes no stored profile data.",
+      "Partially updates a profile's editable fields, first saving the previous version into its history (latest 20 kept). Fields the payload leaves empty keep their stored values (D-02): images, greeting, link_summary, avatar_memory, candidate_id, summary, background text/links, call_user_as, speech style, voice kind/speed, and the whole image_base (type, image_ref, and all 13 elements — a default-stub image_base never overwrites a stored one). List a field in allow_clear to clear it intentionally (\"image_base\" / \"elements\" / \"elements:<key>\" / \"image_ref\" address the image base). If background.links were added or changed and are non-empty, a link_summary regeneration request is queued automatically and preparation returns to pending; link_summary_requeued in the response reports whether that happened. CR-03: with apply_now=true the save also queues exactly one immediate-apply request — a profile_apply generation request (payload: image_ref, primary image, name, speech style, call_user_as) when the profile is active, or a normal switch request when it is not; apply_kind/apply_request_id in the response report which. apply_now=false (default) is save-only. CR-04: apply_phrase carries the canned phrase for that request (paste it into chat to trigger it). CR-06: speech carries structured fields (structured.first_person/second_person/catchphrase/memo plus top-level call_user_as and speech.style) with per-field sources (speech.sources: auto/manual/null); values changed through this action become manual and are protected from generation write-backs, empty speech fields keep stored values unless listed in allow_clear (speech_first_person / speech_second_person / speech_catchphrase / speech_memo), and the profile_apply payload includes the merged speech fields (speech / speech_structured / speech_sources). CR-07: background.user_relationship is the optional 「私の扱い」 (what the user is to this character — master, friend, …); it is preserved on empty like the other background fields (allow_clear: \"user_relationship\" clears it intentionally), is carried in the auto link_summary requeue payload and in the profile_apply payload (user_relationship / background_user_relationship), and switch requests expose it on their output for the chat side. CR-08: data.flavor is the フレーバー設定 {level 0-5 (default 3), traits[{id, label, examples[], scenes[], enabled, source auto/manual}]}; traits added/changed through this action become manual (protected from generation write-backs), an empty traits payload keeps the stored flavor unless allow_clear lists \"flavor_traits\", and the profile_apply payload includes the merged flavor (flavor / flavor_level / flavor_traits / flavor_enabled_traits: level + enabled traits only). CR-10: data carries theme_color (#rrggbb) + theme_color_source (auto/manual/default); a manual theme color is never overwritten by automatic acquisition or stub payloads (list \"theme_color\" in allow_clear when the user changed it or returned it to automatic on purpose), and a still-default profile is initialized from its appearance elements on read. CR-14: each flavor trait also carries frequency (0-5 or null; null = follow the global level, a number overrides it for that trait only, same stage meanings as the global bar). Switch output, profile_apply payloads, and generation payloads carry per-trait effective_frequency (frequency ?? level) and frequency_is_custom; a trait with effective_frequency 0 is handed over with 0 explicitly and must be treated like a disabled trait (never shown). Legacy traits parse with frequency null, so existing profiles behave exactly as before. CR-12: each flavor trait carries auto_examples (「例文を自動作成」); when a save leaves any trait with auto_examples on and no examples, a flavor_examples generation request is queued for the profile (an already-open one is refreshed with the current targets instead of duplicated) and its id is returned as flavor_examples_request_id. The request payload carries the target traits (id/label/scenes) plus speech, summary, background summary, and user_relationship as context. CR-17: background carries video_urls (参考動画URL, kept separate from links), video_notes (tone findings from the videos' dialogue), unreadable_videos, and video_processed_urls; video_urls are preserved on empty like links (allow_clear: \"video_urls\" clears them intentionally) and the generation-managed video fields survive stub payloads. When a save leaves any video URL no transcript attempt has covered, exactly one video_transcript generation request is queued or refreshed for the profile and its id is returned as video_transcript_request_id; the profile_apply payload and the auto link_summary requeue carry video_notes as tone reference material. CR-23: video_urls may include YouTube playlist URLs (youtube.com/playlist?list=…); they are stored and queued like any other video URL, and the video_transcript payload flags them (playlist_urls + playlist_note) so the chat side transcribes every video in the list. CR-19: background.portrayal_focus is the optional 「演じる姿・状況」 (a specific portrayal/situation to bias toward — 中学生の時のみ / 闇落ちした状態 / もしものif設定 etc.); it is preserved on empty like user_relationship (allow_clear: \"portrayal_focus\" clears it intentionally). Only when set: generation payloads carry portrayal_focus + portrayal_focus_note (use ONLY the material matching that portrayal/situation; for videos pick the matching chapters/segments; if nothing matches, report that in the write-back instead of filling from other states), and the profile_apply payload carries it with the acting premise (respond in that portrayal/situation). When empty, no portrayal keys or bias instructions appear anywhere and behavior is exactly as before. CR-20: when portrayal_focus actually changes in a save (set, changed, or cleared), re-inference is queued under the new bias — a link_summary request is re-queued when the profile has background links, and a video_transcript request is re-queued with force (already-processed videos included) when it has reference videos; a save that leaves the value unchanged queues neither for this reason. CR-21: background also carries the portrayal check state (portrayal_focus_status: unknown/ok/failed, portrayal_focus_failure_reason, portrayal_focus_checks {link_summary, video_transcript: match/no_match/null}) — it is generation-managed (write-backs and this action's reset are the only writers; payloads cannot set it). When portrayal_focus actually changes, the state resets to unknown with no checks and no reason, and the CR-20 re-queue re-judges it. While the state is failed, the bias is inactive: the profile_apply payload built here carries no portrayal keys, exactly like an unused field. CR-21 addendum: CLEARING portrayal_focus (empty value + allow_clear) counts as a change exactly like setting/editing it — including while the state is failed, the reset and the re-queue (link_summary when links exist, video_transcript with force when videos exist) always fire together, so the full-material write-backs that follow restore link_summary / video_notes to normal content and the failed state/badge clears. CR-21 addendum 2: the set → cleared transition is additionally a repair trigger for avatar_memory — the re-queue payloads fired by that save (link_summary and/or video_transcript) carry the current avatar_memory with avatar_memory_repair: true and an instruction to remove any elements written into the memory because of the removed specification (keeping all other facts) and return the repaired text as the write-back's avatar_memory. A save where portrayal_focus does not actually change fires no re-queue and no memory repair, and profiles that never had a focus are completely unaffected. CR-22: the profile_apply payload queued with apply_now=true always carries address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方), for every profile regardless of its call_user_as / second_person settings; it is a handover note only and changes no stored profile data. CR-24: the request also accepts sync_to_chara_chat (the edit form's 「キャラチャットに反映する」 checkbox): when present it becomes the stored data.chara_chat_sync preference (an absent value preserves the stored preference; a payload leaving the data field null likewise), and when true this save additionally queues (or refreshes) exactly one chara_chat_sync generation request for the profile — but only when a receiver app is discovered in this environment under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction, whose protocol response the mediator verifies before pushing; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus; no fixed destination); the request payload and the kicked mediator carry the DISCOVERED target slug, and chara_chat_sync_request_id / chara_chat_target_slug in the response report the outcome (both null when off, absent, trashed, or no target found). data.chara_chat_synced_at is write-back-managed (only a completed chara_chat_sync write-back sets it) and survives every payload.",
     request: z.object({
       id: z.string().min(1),
       name: z.string().trim().min(1).max(100),
@@ -2560,6 +2809,14 @@ export const Actions = {
       // profile_apply generation request is queued; for a non-active
       // profile a normal switch request is queued instead.
       apply_now: z.boolean().default(false),
+      // CR-24: the edit form's 「キャラチャットに反映する」 checkbox.
+      // When present, the value becomes the profile's stored
+      // chara_chat_sync preference; when true, this save also queues a
+      // chara_chat_sync request (mediator kicked) — but only if an app
+      // publishing the profile-import interface is discovered in this
+      // environment. When absent (agent-side stub saves), the stored
+      // preference is preserved and nothing is queued.
+      sync_to_chara_chat: z.boolean().optional(),
     }),
     response: z.object({
       ok: z.literal(true),
@@ -2578,7 +2835,13 @@ export const Actions = {
       // so the UI can show it with a copy button right after saving. The
       // user pastes it into chat as the formal trigger.
       apply_phrase: z.string().nullable(),
+      // CR-24: id of the chara_chat_sync request this save queued or
+      // refreshed, and the discovered target app's slug (both null when
+      // the checkbox was off/absent or no import target was found).
+      chara_chat_sync_request_id: z.string().nullable(),
+      chara_chat_target_slug: z.string().nullable(),
     }),
+    privileged: [privileged.findProfileImportTarget],
     async handler(
       ctx,
       args,
@@ -2590,6 +2853,8 @@ export const Actions = {
       apply_kind: "profile_apply" | "switch" | null;
       apply_request_id: string | null;
       apply_phrase: string | null;
+      chara_chat_sync_request_id: string | null;
+      chara_chat_target_slug: string | null;
     }> {
       const db = ctx.db<typeof schema>();
       const row = await getRow(ctx, args.id);
@@ -2601,6 +2866,12 @@ export const Actions = {
       // the links empty (and therefore kept the stored ones) is not
       // mistaken for a link change.
       const merged = mergePreservingManagedFields(before, args.data, args.allow_clear);
+      // CR-24: an explicitly passed checkbox state becomes the stored
+      // preference (the merge above only preserves it when the payload
+      // left it unset). Queueing happens after the save, below.
+      if (args.sync_to_chara_chat !== undefined) {
+        merged.chara_chat_sync = args.sync_to_chara_chat;
+      }
       // CR-17: drop transcript bookkeeping entries for video URLs that
       // are no longer on the profile — a removed video's failure record
       // or processed mark must not linger and mislead the detail screen.
@@ -2885,6 +3156,26 @@ export const Actions = {
           apply_kind = "switch";
         }
       }
+      // CR-24: with the 「キャラチャットに反映する」 checkbox on, this
+      // save also queues (or refreshes) the profile's chara_chat_sync
+      // request against the import target discovered in this
+      // environment and kicks the mediator. No discovered target (or a
+      // trashed profile) queues nothing; the save itself is unaffected.
+      let charaSyncRequestId: string | null = null;
+      let charaTargetSlug: string | null = null;
+      if (args.sync_to_chara_chat && !row.deletedAt) {
+        const target = await discoverCharaImportTarget(ctx);
+        if (target) {
+          charaTargetSlug = target.slug;
+          charaSyncRequestId = await queueCharaChatSyncRequest(
+            ctx,
+            args.id,
+            args.name,
+            now.toISOString(),
+            target,
+          );
+        }
+      }
       ctx.invalidateQueries();
       return {
         ok: true,
@@ -2899,6 +3190,8 @@ export const Actions = {
             : apply_kind === "switch" && apply_request_id
               ? switchPhrase(args.name, apply_request_id)
               : null,
+        chara_chat_sync_request_id: charaSyncRequestId,
+        chara_chat_target_slug: charaTargetSlug,
       };
     },
   }),
@@ -3458,7 +3751,7 @@ export const Actions = {
 
   createGenerationRequest: defineAction({
     description:
-      "Queues a request for the chat-side agent: image_generation, link_summary, trial_conversation, profile_apply (CR-03: apply an edit to the active avatar right away; normally created by updateProfile with apply_now=true), or flavor_examples (CR-12: invent example lines for flavor traits whose auto_examples flag is on and whose examples are empty — normally queued automatically by createProfile/updateProfile; when created through this action for a profile, the payload is rebuilt server-side from the profile's current targets and context, and an already-open flavor_examples request for that profile is refreshed instead of duplicated). Payload is a JSON string describing what to generate. For profile_apply the response also carries the canned phrase (CR-04) to paste into chat as the trigger. CR-06: link_summary / trial_conversation payloads are enriched server-side with the profile's merged speech fields (speech / speech_structured), their sources (speech_sources), and manual_speech_fields — infer the non-manual speech fields from the background links/name and return them in the write-back result. CR-07: those payloads also carry user_relationship (「私の扱い」) with a note to follow it in greeting/tone generation when set; it is the user's own specification and must never be changed by a write-back. CR-08: those payloads also carry the flavor setting (flavor: level + enabled traits; flavor_traits: all stored traits; manual_flavor_traits: the protected manual ones) — infer flavor traits from the background links/name and return them in the write-back result as flavor_traits [{label, examples[], scenes[], enabled}]; never change manual traits or the level. video_transcript (CR-17: fetch the transcripts of the profile's 参考動画URL and mine the dialogue for tone — normally queued automatically by createProfile/updateProfile when an unprocessed video URL exists; when created through this action the payload is rebuilt server-side from the profile's current video URLs and context with force, and an already-open video_transcript request is refreshed instead of duplicated). CR-23: a YouTube playlist URL (youtube.com/playlist?list=…) among the video URLs is flagged in the payload as playlist_urls with a playlist_note — the chat side expands the list and fetches the transcript of every video in it, mining the whole list's dialogue together into one video_notes; per-video failures are reported in unreadable_videos as 「{playlist URL} 内の {video URL}（reason）」 so they stay tied to the playlist entry, and the playlist URL itself is marked attempted like any other video URL. CR-17: link_summary / trial_conversation payloads also carry video_notes (background.video_notes — tone findings from the reference videos' dialogue) as tone reference material. CR-19: when the profile's 「演じる姿・状況」 (background.portrayal_focus) is set, payloads additionally carry portrayal_focus + portrayal_focus_note — for link_summary / flavor_examples / video_transcript / image_generation, use ONLY the source material matching that portrayal/situation (for videos, the matching chapters/segments) and report back (portrayal_focus_no_match) instead of filling from other periods/states when nothing matches; for trial_conversation, respond in that portrayal/situation. When portrayal_focus is empty, no portrayal keys are added at all. CR-20: link_summary payloads state the unified speech/flavor merge rules in their notes (speech_note / speech_merge_note / note, flavor_note) — speech write-backs merge like CR-18 video write-backs (catchphrase union, first/second person fill-only, memo/style as integrated text) and flavor write-backs merge into existing auto traits instead of replacing them; video_transcript payloads carry the current flavor (flavor / flavor_traits with auto/manual distinction, manual_flavor_traits, flavor_note) and their results may carry flavor_traits. CR-21: the portrayal notes (portrayal_focus_note) now state the fall-back contract — when no source material matches the specified portrayal/situation, ignore the bias and build the summary/tone from ALL material as usual (never replace the summary or notes with a 'no material' text), and report the miss in the result as portrayal_focus_no_match: true with portrayal_focus_no_match_reason (a reason sentence). While a profile's portrayal check state is failed, its bias is inactive and NO portrayal keys are added to any payload (generation, trial, image) — the payload is exactly the one an unused-field profile gets. CR-22: trial_conversation payloads (acting) are enriched server-side with address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方) — for every profile regardless of its call_user_as / second_person settings, and a profile_apply payload created through this action gains it too; the generation kinds (link_summary / video_transcript / flavor_examples / image_generation) never carry it.",
+      "Queues a request for the chat-side agent: image_generation, link_summary, trial_conversation, profile_apply (CR-03: apply an edit to the active avatar right away; normally created by updateProfile with apply_now=true), or flavor_examples (CR-12: invent example lines for flavor traits whose auto_examples flag is on and whose examples are empty — normally queued automatically by createProfile/updateProfile; when created through this action for a profile, the payload is rebuilt server-side from the profile's current targets and context, and an already-open flavor_examples request for that profile is refreshed instead of duplicated). Payload is a JSON string describing what to generate. For profile_apply the response also carries the canned phrase (CR-04) to paste into chat as the trigger. CR-06: link_summary / trial_conversation payloads are enriched server-side with the profile's merged speech fields (speech / speech_structured), their sources (speech_sources), and manual_speech_fields — infer the non-manual speech fields from the background links/name and return them in the write-back result. CR-07: those payloads also carry user_relationship (「私の扱い」) with a note to follow it in greeting/tone generation when set; it is the user's own specification and must never be changed by a write-back. CR-08: those payloads also carry the flavor setting (flavor: level + enabled traits; flavor_traits: all stored traits; manual_flavor_traits: the protected manual ones) — infer flavor traits from the background links/name and return them in the write-back result as flavor_traits [{label, examples[], scenes[], enabled}]; never change manual traits or the level. video_transcript (CR-17: fetch the transcripts of the profile's 参考動画URL and mine the dialogue for tone — normally queued automatically by createProfile/updateProfile when an unprocessed video URL exists; when created through this action the payload is rebuilt server-side from the profile's current video URLs and context with force, and an already-open video_transcript request is refreshed instead of duplicated). CR-23: a YouTube playlist URL (youtube.com/playlist?list=…) among the video URLs is flagged in the payload as playlist_urls with a playlist_note — the chat side expands the list and fetches the transcript of every video in it, mining the whole list's dialogue together into one video_notes; per-video failures are reported in unreadable_videos as 「{playlist URL} 内の {video URL}（reason）」 so they stay tied to the playlist entry, and the playlist URL itself is marked attempted like any other video URL. CR-17: link_summary / trial_conversation payloads also carry video_notes (background.video_notes — tone findings from the reference videos' dialogue) as tone reference material. CR-19: when the profile's 「演じる姿・状況」 (background.portrayal_focus) is set, payloads additionally carry portrayal_focus + portrayal_focus_note — for link_summary / flavor_examples / video_transcript / image_generation, use ONLY the source material matching that portrayal/situation (for videos, the matching chapters/segments) and report back (portrayal_focus_no_match) instead of filling from other periods/states when nothing matches; for trial_conversation, respond in that portrayal/situation. When portrayal_focus is empty, no portrayal keys are added at all. CR-20: link_summary payloads state the unified speech/flavor merge rules in their notes (speech_note / speech_merge_note / note, flavor_note) — speech write-backs merge like CR-18 video write-backs (catchphrase union, first/second person fill-only, memo/style as integrated text) and flavor write-backs merge into existing auto traits instead of replacing them; video_transcript payloads carry the current flavor (flavor / flavor_traits with auto/manual distinction, manual_flavor_traits, flavor_note) and their results may carry flavor_traits. CR-21: the portrayal notes (portrayal_focus_note) now state the fall-back contract — when no source material matches the specified portrayal/situation, ignore the bias and build the summary/tone from ALL material as usual (never replace the summary or notes with a 'no material' text), and report the miss in the result as portrayal_focus_no_match: true with portrayal_focus_no_match_reason (a reason sentence). While a profile's portrayal check state is failed, its bias is inactive and NO portrayal keys are added to any payload (generation, trial, image) — the payload is exactly the one an unused-field profile gets. CR-22: trial_conversation payloads (acting) are enriched server-side with address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方) — for every profile regardless of its call_user_as / second_person settings, and a profile_apply payload created through this action gains it too; the generation kinds (link_summary / video_transcript / flavor_examples / image_generation) never carry it. CR-24: kind chara_chat_sync reflects one profile into the chara-chat app — normally queued automatically by createProfile/updateProfile when the form's 「キャラチャットに反映する」 checkbox is on; when created through this action the target is re-discovered server-side under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus), the payload is rebuilt with the discovered target slug, an already-open request for the profile is refreshed instead of duplicated, and the mediator is kicked; it errors when no receiver exists in this environment.",
     request: z.object({
       profile_id: z.string().min(1).nullable().default(null),
       kind: z.enum([
@@ -3468,6 +3761,7 @@ export const Actions = {
         "profile_apply",
         "flavor_examples",
         "video_transcript",
+        "chara_chat_sync",
       ]),
       payload: z.string().max(20000).default("{}"),
     }),
@@ -3475,6 +3769,7 @@ export const Actions = {
       request_id: z.string(),
       phrase: z.string().nullable(),
     }),
+    privileged: [privileged.findProfileImportTarget],
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       let profileName: string | null = null;
@@ -3516,6 +3811,31 @@ export const Actions = {
         );
         if (!queuedId)
           throw new Error("参考動画URLが設定されていません。");
+        ctx.invalidateQueries();
+        return { request_id: queuedId, phrase: null };
+      }
+      // CR-24: chara_chat_sync requests are owned by their queue helper
+      // too — the target is re-discovered at queue time (never taken
+      // from the caller's payload), the payload is rebuilt server-side,
+      // an already-open request is refreshed instead of duplicated, and
+      // the mediator is kicked. With no import target discovered in
+      // this environment the request cannot be created at all.
+      if (args.kind === "chara_chat_sync") {
+        if (!args.profile_id)
+          throw new Error("chara_chat_sync には profile_id が必要です。");
+        const row = await getRow(ctx, args.profile_id);
+        const target = await discoverCharaImportTarget(ctx);
+        if (!target)
+          throw new Error(
+            "取り込み用インターフェースを持つ連携先アプリが見つかりません。",
+          );
+        const queuedId = await queueCharaChatSyncRequest(
+          ctx,
+          args.profile_id,
+          row.name,
+          row.updatedAt.toISOString(),
+          target,
+        );
         ctx.invalidateQueries();
         return { request_id: queuedId, phrase: null };
       }
@@ -3747,7 +4067,7 @@ export const Actions = {
 
   completeGenerationRequest: defineAction({
     description:
-      "Writes back a generation request result, field-scoped to the request kind (other profile fields and edits made in the meantime are preserved, D-02/R-12). For link_summary, result JSON {summary, unreadable_links} is applied; for image_generation, result JSON {file, blob_key, source} is appended to the images; for trial_conversation the greeting text is stored. CR-06: link_summary / trial_conversation results may also carry structured speech fields — flat keys (first_person, second_person, call_user_as, catchphrase, memo, style) or a nested speech/speech_structured object — which are stored as auto-generated values; fields the user set manually (speech.sources = manual) are never overwritten. CR-08: those results may also carry flavor traits (flavor_traits, flavor.traits, or traits: [{label, examples[], scenes[], enabled}]). CR-20: flavor write-backs MERGE into the existing auto traits instead of replacing them — a trait whose label matches an existing auto trait is updated on top of it (examples union-merged; scenes/enabled/frequency keep the stored values), a new label is added as a new auto trait, and auto traits absent from the write-back are kept; manual flavor traits are kept exactly and the flavor level never changes. For profile_apply (CR-03), result JSON may carry only {candidate_id, image_ref} (image_ref also accepted as image_base.image_ref) — those two fields alone are written back and everything else is preserved; a failed profile_apply touches no profile field. CR-12: for flavor_examples, the result carries example lines per trait — {examples_by_trait: {<trait id>: [lines]}} (flavor_examples in the same shape, or a traits-style array, are also accepted) — and each line set is stored on its trait ONLY if that trait still has no examples (examples the user typed in the meantime win and are never overwritten); a failed flavor_examples touches no profile field and no preparation item. A link_summary / trial_conversation write-back that creates auto flavor traits with auto_examples on and no examples queues a flavor_examples request for them. On failed (other kinds), only that kind's preparation item flips to failed and the reason is stored on the profile (preparation_errors) so the UI can show it with a retry path (D-03). CR-17: for video_transcript, the result is {video_notes, catchphrases[], unreadable_videos[]} — video_notes is stored on background.video_notes, catchphrases and any other speech fields in the result are applied as auto tone material (manual speech fields are never overwritten, CR-06 rule), unreadable_videos are recorded on the profile, and every current video URL is marked attempted (video_processed_urls). CR-20: link_summary / trial_conversation speech write-backs follow the same merge rules as video_transcript (see CR-18 below), and video_transcript results may also carry flavor_traits, applied with the CR-20 flavor merge. CR-18: video_transcript speech write-backs MERGE with existing auto fields instead of replacing them — catchphrase is union-merged (stored items kept, new candidates appended, deduplicated, joined with '／'), first_person / second_person are filled only when currently unset (an existing value is never overwritten), and memo / style in the result are treated as text already integrated with the existing tone (the request payload's note instructs the chat side to return them that way) and applied to the auto field as returned. A completed batch where every video was unreadable and no notes were produced flips the video preparation item to failed with the unreadable list as the reason; a failed video_transcript flips only the video item to failed with the reason — in both cases the profile itself and all other fields stay untouched and the profile remains usable. Write-backs for trashed profiles are recorded on the request only. CR-21: completed link_summary / video_transcript write-backs also record a portrayal verdict against the profile's current portrayal_focus (background.portrayal_focus_checks): result portrayal_focus_no_match: true (with portrayal_focus_no_match_reason) records a no_match for that kind; otherwise a completed link_summary records a match, and a video_transcript records a match when it produced video_notes (an all-unreadable batch with no notes records nothing unless the flag is present). The derived background.portrayal_focus_status is ok when any recorded check matched, failed when at least one check completed and all recorded checks are no_match (the latest reason is kept in portrayal_focus_failure_reason), and unknown otherwise. The verdict never alters content: a no-match write-back's summary/video_notes are stored exactly as returned (under the CR-21 contract they are built from all material), and the preparation state is untouched — a failed bias does not make the profile 要対応 and it stays ready/usable. While failed, the bias is inactive for switch output and every payload until a later check records a match. CR-21 addendum guard: when a result carries portrayal_focus_no_match, a summary / video_notes field that is missing — or that is just the bare 'no matching material' notice sentence — never overwrites the stored link_summary / video_notes; the stored full content is kept (only the verdict is recorded). CR-21 addendum 2: for link_summary / video_transcript requests whose payload carries the avatar_memory_repair marker (queued by updateProfile when portrayal_focus was removed), a completed result that returns a non-empty avatar_memory replaces the stored avatar_memory (the repaired text: specification-derived elements removed, other facts kept); a result without avatar_memory — or with an empty one — leaves the stored memory exactly as it was, and write-backs of non-repair requests never touch avatar_memory at all.",
+      "Writes back a generation request result, field-scoped to the request kind (other profile fields and edits made in the meantime are preserved, D-02/R-12). For link_summary, result JSON {summary, unreadable_links} is applied; for image_generation, result JSON {file, blob_key, source} is appended to the images; for trial_conversation the greeting text is stored. CR-06: link_summary / trial_conversation results may also carry structured speech fields — flat keys (first_person, second_person, call_user_as, catchphrase, memo, style) or a nested speech/speech_structured object — which are stored as auto-generated values; fields the user set manually (speech.sources = manual) are never overwritten. CR-08: those results may also carry flavor traits (flavor_traits, flavor.traits, or traits: [{label, examples[], scenes[], enabled}]). CR-20: flavor write-backs MERGE into the existing auto traits instead of replacing them — a trait whose label matches an existing auto trait is updated on top of it (examples union-merged; scenes/enabled/frequency keep the stored values), a new label is added as a new auto trait, and auto traits absent from the write-back are kept; manual flavor traits are kept exactly and the flavor level never changes. For profile_apply (CR-03), result JSON may carry only {candidate_id, image_ref} (image_ref also accepted as image_base.image_ref) — those two fields alone are written back and everything else is preserved; a failed profile_apply touches no profile field. CR-12: for flavor_examples, the result carries example lines per trait — {examples_by_trait: {<trait id>: [lines]}} (flavor_examples in the same shape, or a traits-style array, are also accepted) — and each line set is stored on its trait ONLY if that trait still has no examples (examples the user typed in the meantime win and are never overwritten); a failed flavor_examples touches no profile field and no preparation item. A link_summary / trial_conversation write-back that creates auto flavor traits with auto_examples on and no examples queues a flavor_examples request for them. On failed (other kinds), only that kind's preparation item flips to failed and the reason is stored on the profile (preparation_errors) so the UI can show it with a retry path (D-03). CR-17: for video_transcript, the result is {video_notes, catchphrases[], unreadable_videos[]} — video_notes is stored on background.video_notes, catchphrases and any other speech fields in the result are applied as auto tone material (manual speech fields are never overwritten, CR-06 rule), unreadable_videos are recorded on the profile, and every current video URL is marked attempted (video_processed_urls). CR-20: link_summary / trial_conversation speech write-backs follow the same merge rules as video_transcript (see CR-18 below), and video_transcript results may also carry flavor_traits, applied with the CR-20 flavor merge. CR-18: video_transcript speech write-backs MERGE with existing auto fields instead of replacing them — catchphrase is union-merged (stored items kept, new candidates appended, deduplicated, joined with '／'), first_person / second_person are filled only when currently unset (an existing value is never overwritten), and memo / style in the result are treated as text already integrated with the existing tone (the request payload's note instructs the chat side to return them that way) and applied to the auto field as returned. A completed batch where every video was unreadable and no notes were produced flips the video preparation item to failed with the unreadable list as the reason; a failed video_transcript flips only the video item to failed with the reason — in both cases the profile itself and all other fields stay untouched and the profile remains usable. Write-backs for trashed profiles are recorded on the request only. CR-21: completed link_summary / video_transcript write-backs also record a portrayal verdict against the profile's current portrayal_focus (background.portrayal_focus_checks): result portrayal_focus_no_match: true (with portrayal_focus_no_match_reason) records a no_match for that kind; otherwise a completed link_summary records a match, and a video_transcript records a match when it produced video_notes (an all-unreadable batch with no notes records nothing unless the flag is present). The derived background.portrayal_focus_status is ok when any recorded check matched, failed when at least one check completed and all recorded checks are no_match (the latest reason is kept in portrayal_focus_failure_reason), and unknown otherwise. The verdict never alters content: a no-match write-back's summary/video_notes are stored exactly as returned (under the CR-21 contract they are built from all material), and the preparation state is untouched — a failed bias does not make the profile 要対応 and it stays ready/usable. While failed, the bias is inactive for switch output and every payload until a later check records a match. CR-21 addendum guard: when a result carries portrayal_focus_no_match, a summary / video_notes field that is missing — or that is just the bare 'no matching material' notice sentence — never overwrites the stored link_summary / video_notes; the stored full content is kept (only the verdict is recorded). CR-21 addendum 2: for link_summary / video_transcript requests whose payload carries the avatar_memory_repair marker (queued by updateProfile when portrayal_focus was removed), a completed result that returns a non-empty avatar_memory replaces the stored avatar_memory (the repaired text: specification-derived elements removed, other facts kept); a result without avatar_memory — or with an empty one — leaves the stored memory exactly as it was, and write-backs of non-repair requests never touch avatar_memory at all. CR-24: for chara_chat_sync, a completed write-back only stamps the profile's chara_chat_synced_at (the import itself happened in the target app); a failed one touches no profile field and no preparation item.",
     request: z.object({
       request_id: z.string().min(1),
       status: z.enum(["processing", "completed", "failed"]),
@@ -3838,7 +4158,8 @@ export const Actions = {
           prof[0] &&
           !prof[0].deletedAt &&
           req.kind !== "flavor_examples" &&
-          req.kind !== "video_transcript"
+          req.kind !== "video_transcript" &&
+          req.kind !== "chara_chat_sync"
         ) {
           // Field-scoped write-back (D-02/R-12): start from the profile's
           // CURRENT stored data (re-read above, so edits made while the
@@ -4279,6 +4600,24 @@ export const Actions = {
           if (args.status === "completed") {
             await queueFlavorExamplesRequest(ctx, req.profileId, prof[0].name, data);
           }
+        } else if (prof[0] && !prof[0].deletedAt && req.kind === "chara_chat_sync") {
+          // CR-24 chara_chat_sync write-back: the reflection happened
+          // in the TARGET app (its server did the import); the only
+          // trace on this profile is the completion time. A completed
+          // sync stamps chara_chat_synced_at; a failed one touches no
+          // profile field (the failure reason stays on the request).
+          // No preparation item exists for this kind.
+          if (args.status === "completed") {
+            const data = parseData(prof[0].data);
+            data.chara_chat_synced_at = now.toISOString();
+            await db
+              .update(schema.profiles)
+              .set({
+                data: JSON.stringify(withPreparation(data)),
+                updatedAt: now,
+              })
+              .where(eq(schema.profiles.id, req.profileId));
+          }
         }
       }
       ctx.invalidateQueries();
@@ -4639,6 +4978,28 @@ export const Actions = {
   }),
 
   // -- Summary / seed -----------------------------------------------------------
+
+  getCharaChatSyncStatus: defineAction({
+    description:
+      "CR-24: reports whether profile auto-reflection into a chara-chat app is available in THIS environment. The destination is discovered by function, never by a fixed slug/id/name, following the receiver-side interop contract: primarily an app publishing the self-introduction action getAvatarReceiverInfo (its response — protocol \"avatar-profile-receiver\", protocol_version 1 — is verified by the mediator immediately before each push; discovery_method \"handshake\"), or, for older receivers without it, an app publishing all of importCharactersBulk / getImportStates / getImportStatus (discovery_method \"legacy\"). Returns that app's slug and display name as read from its own space.json. available=false (with null target fields) when no such app exists or the scan fails — the create/edit forms then show the checkbox off with 自動反映不可， and saving is unaffected.",
+    request: z.object({}),
+    response: z.object({
+      available: z.boolean(),
+      target_slug: z.string().nullable(),
+      target_name: z.string().nullable(),
+      discovery_method: z.enum(["handshake", "legacy"]).nullable(),
+    }),
+    privileged: [privileged.findProfileImportTarget],
+    async handler(ctx) {
+      const target = await discoverCharaImportTarget(ctx);
+      return {
+        available: target !== null,
+        target_slug: target?.slug ?? null,
+        target_name: target?.name ?? null,
+        discovery_method: target?.method ?? null,
+      };
+    },
+  }),
 
   getSummary: defineAction({
     description:
