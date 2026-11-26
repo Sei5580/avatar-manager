@@ -4452,6 +4452,107 @@ export const Actions = {
     },
   }),
 
+  // Lightweight profile index for the キャラチャット bulk import's
+  // two-stage diff (二段構え): returns ONLY {id, name, updated_at} for
+  // every non-deleted profile — no profile body, images, or summaries —
+  // so the import mediator can decide which profiles changed without
+  // moving full profile text through the mediator. Read-only; trashed
+  // profiles are excluded, matching the mediator's existing target
+  // range. Pair with exportAllProfiles' optional `ids` filter to fetch
+  // full bodies for just the changed profiles.
+  listProfileStubs: defineAction({
+    description:
+      "Lightweight index of every non-deleted avatar profile for the character-chat import's two-stage diff: returns only id, name, and updated_at per profile (no profile body, images, or summaries). Read-only; trashed profiles are excluded.",
+    request: z.object({}),
+    response: z.object({
+      count: z.number(),
+      profiles: z.array(
+        z.object({
+          id: z.string(),
+          name: z.string(),
+          updated_at: z.string(),
+        }),
+      ),
+    }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select({
+          id: schema.profiles.id,
+          name: schema.profiles.name,
+          updatedAt: schema.profiles.updatedAt,
+        })
+        .from(schema.profiles)
+        .where(isNull(schema.profiles.deletedAt));
+      const sorted = [...rows].sort((a, b) =>
+        a.name.localeCompare(b.name, "ja"),
+      );
+      const profiles = sorted.map((r) => ({
+        id: r.id,
+        name: r.name,
+        updated_at: r.updatedAt.toISOString(),
+      }));
+      return { count: profiles.length, profiles };
+    },
+  }),
+
+  // Bulk export for the キャラチャット bulk import (一括転送): every
+  // non-deleted profile in ONE read, so the import mediator no longer
+  // has to fetch profiles one by one (listProfiles + getProfile per
+  // profile). Read-only; the range matches the mediator's existing
+  // target range exactly — deleted (trashed) profiles are excluded.
+  // Each entry carries the profile id, name, and updated_at at the top
+  // level (for cheap diffing by updated_at) plus `profile`: the
+  // complete avatar-profile v1.0 body, identical to getProfile's
+  // output — images entries include both file and the resolved url.
+  // 二段構え: pass the optional `ids` array to fetch full bodies for
+  // only those profiles (e.g. the ones listProfileStubs showed as
+  // changed); omit it to get every non-deleted profile, as before.
+  exportAllProfiles: defineAction({
+    description:
+      "Bulk export for the character-chat import: returns non-deleted avatar profiles in a single response. Each entry has the profile id, name, and updated_at, plus the complete avatar-profile v1.0 profile body (same shape as getProfile, images include file and url). Pass the optional ids array to return only those profiles (two-stage diff: listProfileStubs first, then fetch only the changed ones); omit ids to return every non-deleted profile. Read-only; trashed profiles are excluded, matching the import mediator's existing target range.",
+    request: z.object({
+      ids: z.array(z.string().min(1)).max(500).optional(),
+    }),
+    response: z.object({
+      count: z.number(),
+      profiles: z.array(
+        z.object({
+          id: z.string(),
+          name: z.string(),
+          updated_at: z.string(),
+          profile: profileOutSchema,
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.profiles)
+        .where(isNull(schema.profiles.deletedAt));
+      const wanted =
+        args.ids === undefined ? null : new Set(args.ids);
+      const filtered =
+        wanted === null ? rows : rows.filter((r) => wanted.has(r.id));
+      const sorted = [...filtered].sort((a, b) =>
+        a.name.localeCompare(b.name, "ja"),
+      );
+      const profiles = await Promise.all(
+        sorted.map(async (r) => {
+          const profile = await toProfileOut(ctx, r);
+          return {
+            id: r.id,
+            name: r.name,
+            updated_at: r.updatedAt.toISOString(),
+            profile,
+          };
+        }),
+      );
+      return { count: profiles.length, profiles };
+    },
+  }),
+
   importProfile: defineAction({
     description:
       "Imports an avatar-profile JSON text as a new profile (new id; embedded blob images are kept as file references). CR-16: voice.reserved is accepted as false or true on import and normalized to true on save (it is only a reservation flag for a future voice feature); all other validation stays strict.",
