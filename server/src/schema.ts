@@ -45,10 +45,12 @@ export const switchRequests = sqliteTable("switch_requests", {
 // link summaries, trial conversations, profile_apply (CR-03: apply an
 // edit to the currently active avatar right away), flavor_examples
 // (CR-12: auto-generate example lines for flavor traits whose
-// auto_examples flag is on and whose examples are empty), and
+// auto_examples flag is on and whose examples are empty),
 // video_transcript (CR-17: fetch the transcripts of the profile's
-// 参考動画URL and mine the dialogue for tone material). The SQL column
-// is plain TEXT, so a new kind needs no migration.
+// 参考動画URL and mine the dialogue for tone material), and
+// chara_chat_sync (CR-24: reflect the profile into the chara-chat app
+// discovered in this environment). The SQL column is plain TEXT, so a
+// new kind needs no migration.
 export const generationRequests = sqliteTable("generation_requests", {
   id: text("id").primaryKey(),
   profileId: text("profile_id"),
@@ -60,6 +62,7 @@ export const generationRequests = sqliteTable("generation_requests", {
       "profile_apply",
       "flavor_examples",
       "video_transcript",
+      "chara_chat_sync",
     ],
   }).notNull(),
   payload: text("payload").notNull().default("{}"),
