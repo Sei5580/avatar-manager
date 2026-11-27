@@ -7,8 +7,8 @@
 // history is never passed anywhere: switch_settings.pass_conversation_summary
 // is format-only, always false, and has no UI or code path.
 
-import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { defineAction, z, type ActionsModule, type Ctx, type SpaceDb } from "@hatch/space-sdk";
+import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
 import * as schema from "./schema";
 // CR-24: host-side discovery of the chara-chat import target (see
 // server/src/privileged.ts). The descriptor module is generated from
@@ -129,14 +129,6 @@ const emptySpeechSources: z.infer<typeof speechSourcesSchema> = {
 // ユーザーが追加・編集した項目は "manual" になり、生成の書き戻しでは
 // 上書き・削除されない。書き戻しは "auto" 項目だけを対象にマージされる（CR-20）。
 // レベルはユーザーのバー調整が正で、書き戻しでは変更されない。
-export const FLAVOR_SCENE_PRESETS = [
-  "挨拶時",
-  "完了時",
-  "成功時",
-  "失敗時",
-  "ふだん",
-] as const;
-
 const flavorTraitSchema = z.object({
   id: z.string().max(200),
   label: z.string().max(200).default(""),
@@ -218,6 +210,21 @@ const THEME_COLOR_KEYWORDS: [string, string][] = [
 
 function isValidThemeColor(v: string | null | undefined): boolean {
   return typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v);
+}
+
+// CR-10: apply a candidate theme color (an image's dominant color or a
+// generation result's reported color) to the profile: only when the
+// candidate is a valid color, and never over a color the user picked
+// manually. The stored color is lowercased and its source becomes
+// "auto".
+function applyThemeColorCandidate(
+  data: ProfileData,
+  candidate: string | null | undefined,
+): void {
+  if (isValidThemeColor(candidate) && data.theme_color_source !== "manual") {
+    data.theme_color = (candidate as string).toLowerCase();
+    data.theme_color_source = "auto";
+  }
 }
 
 function inferThemeColorFromElements(
@@ -572,15 +579,6 @@ function normalizeSpeechSources(data: ProfileData): ProfileData {
   return { ...data, speech: { ...data.speech, structured, sources } };
 }
 
-function speechFieldValue(
-  data: ProfileData,
-  key: SpeechFieldKey,
-): string | null {
-  if (key === "call_user_as") return data.call_user_as;
-  if (key === "style") return data.speech.style;
-  return data.speech.structured[key];
-}
-
 // The merged (manual-priority) speech view handed to the chat side in
 // switch / profile_apply payloads and generation requests: stored values
 // already ARE the merge result, because manual values are never
@@ -601,6 +599,69 @@ function manualSpeechFields(data: ProfileData): SpeechFieldKey[] {
   return SPEECH_FIELD_KEYS.filter(
     (k) => data.speech.sources[k] === "manual",
   );
+}
+
+// The structured speech fields (CR-06) as they travel in generation
+// payloads: the stored structured values plus the top-level
+// call_user_as. With `withStyle`, the free-text style rides along as a
+// final key (the profile_apply payload shape).
+function speechStructuredPayload(
+  data: ProfileData,
+  opts?: { withStyle?: boolean },
+) {
+  const structured = {
+    first_person: data.speech.structured.first_person,
+    second_person: data.speech.structured.second_person,
+    call_user_as: data.call_user_as,
+    catchphrase: data.speech.structured.catchphrase,
+    memo: data.speech.structured.memo,
+  };
+  return opts?.withStyle
+    ? { ...structured, style: data.speech.style }
+    : structured;
+}
+
+// The full stored flavor trait list as it travels in generation
+// payloads (CR-08/CR-14): each trait with copied examples/scenes, its
+// frequency (null = follows the global level) made explicit, and its
+// effective_frequency (frequency ?? level).
+function flavorTraitsPayload(data: ProfileData) {
+  const flavor = data.flavor ?? emptyFlavor;
+  return flavor.traits.map((t) => ({
+    ...t,
+    examples: [...t.examples],
+    scenes: [...t.scenes],
+    frequency: t.frequency ?? null,
+    effective_frequency: effectiveFlavorFrequency(t, flavor.level),
+  }));
+}
+
+// The manual flavor traits only, in the reduced shape generation
+// payloads carry (the write-back must never change or remove these).
+function manualFlavorTraitsPayload(data: ProfileData) {
+  const level = (data.flavor ?? emptyFlavor).level;
+  return manualFlavorTraits(data).map((t) => ({
+    label: t.label,
+    examples: [...t.examples],
+    scenes: [...t.scenes],
+    frequency: t.frequency ?? null,
+    effective_frequency: effectiveFlavorFrequency(t, level),
+  }));
+}
+
+// Parse a client-supplied generation payload: a JSON object is used
+// as-is; valid JSON that is not an object (or is an array) yields an
+// empty object; unparseable text is kept as a note.
+function parsePayloadObject(raw: string): Record<string, unknown> {
+  try {
+    const p = JSON.parse(raw) as unknown;
+    if (p && typeof p === "object" && !Array.isArray(p)) {
+      return p as Record<string, unknown>;
+    }
+    return {};
+  } catch {
+    return { note: raw };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,32 +732,33 @@ function portrayalEffectiveValue(data: ProfileData): string | null {
   return portrayalBiasActive(data) ? portrayalFocusValue(data) : null;
 }
 
-// Payload fields for material-based generation kinds. Empty object when
-// the field is unused OR its bias failed (CR-21), so spreading it
-// leaves the payload untouched.
-function portrayalGenerationFields(
+// The portrayal payload fields, with the bias instruction built by
+// `makeNote`. Empty object when the field is unused OR its bias failed
+// (CR-21), so spreading / assigning it leaves the payload untouched.
+function portrayalFields(
   data: ProfileData,
+  makeNote: (pf: string) => string,
 ): Record<string, string> {
   const pf = portrayalEffectiveValue(data);
   if (!pf) return {};
   return {
     portrayal_focus: pf,
     background_portrayal_focus: pf,
-    portrayal_focus_note: portrayalGenerationNote(pf),
+    portrayal_focus_note: makeNote(pf),
   };
 }
 
+// Payload fields for material-based generation kinds.
+function portrayalGenerationFields(
+  data: ProfileData,
+): Record<string, string> {
+  return portrayalFields(data, portrayalGenerationNote);
+}
+
 // Payload fields for acting kinds (profile_apply; switch output uses
-// the same value/note pair through its typed schema). Empty object when
-// the field is unused OR its bias failed (CR-21).
+// the same value/note pair through its typed schema).
 function portrayalActingFields(data: ProfileData): Record<string, string> {
-  const pf = portrayalEffectiveValue(data);
-  if (!pf) return {};
-  return {
-    portrayal_focus: pf,
-    background_portrayal_focus: pf,
-    portrayal_focus_note: portrayalActingNote(pf),
-  };
+  return portrayalFields(data, portrayalActingNote);
 }
 
 // CR-21: record the outcome of one completed portrayal check
@@ -824,6 +886,26 @@ function requestHasMemoryRepair(reqPayload: string): boolean {
     );
   } catch {
     return false;
+  }
+}
+
+// CR-21 addendum 2: apply a write-back's avatar_memory repair. Only a
+// request queued as a portrayal_focus removal repair (requested) whose
+// result returns a non-empty avatar_memory replaces the stored memory;
+// the stored value is the returned text trimmed and capped at the
+// schema limit (20000 chars). Anything else leaves the stored memory
+// exactly as it was.
+function applyAvatarMemoryRepair(
+  data: ProfileData,
+  parsed: Record<string, unknown>,
+  requested: boolean,
+): void {
+  if (
+    requested &&
+    typeof parsed.avatar_memory === "string" &&
+    parsed.avatar_memory.trim()
+  ) {
+    data.avatar_memory = parsed.avatar_memory.trim().slice(0, 20000);
   }
 }
 
@@ -1192,6 +1274,103 @@ function applyAutoFlavorTraits(
 }
 
 // ---------------------------------------------------------------------------
+// Generation-request queue helpers (shared by every request kind)
+// ---------------------------------------------------------------------------
+
+type Db = SpaceDb<typeof schema>;
+
+// A request is still open (未完了) while it waits for the chat-side
+// agent (pending) or is being worked on (processing).
+function isOpenStatus(s: string): boolean {
+  return s === "pending" || s === "processing";
+}
+
+// Insert one fresh generation request in the pending state.
+async function insertPendingGenerationRequest(
+  db: Db,
+  args: {
+    id: string;
+    profileId: string | null;
+    kind: GenRow["kind"];
+    payload: string;
+    now: Date;
+  },
+): Promise<void> {
+  await db.insert(schema.generationRequests).values({
+    id: args.id,
+    profileId: args.profileId,
+    kind: args.kind,
+    payload: args.payload,
+    status: "pending",
+    result: null,
+    reason: null,
+    createdAt: args.now,
+    updatedAt: args.now,
+  });
+}
+
+// Queue (or refresh) the profile's single open request of a kind: when
+// one is already pending/processing its payload is replaced with the
+// freshly built one instead of creating a duplicate; otherwise a new
+// pending request is inserted. buildPayload receives the request id
+// first because some payloads embed it. Returns the request id.
+async function upsertOpenGenerationRequest(
+  ctx: Ctx,
+  profileId: string,
+  kind: GenRow["kind"],
+  buildPayload: (requestId: string) => string,
+): Promise<string> {
+  const db = ctx.db<typeof schema>();
+  const open = await db
+    .select()
+    .from(schema.generationRequests)
+    .where(
+      and(
+        eq(schema.generationRequests.profileId, profileId),
+        eq(schema.generationRequests.kind, kind),
+      ),
+    );
+  const existing = open.find((r) => isOpenStatus(r.status));
+  const now = new Date();
+  if (existing) {
+    await db
+      .update(schema.generationRequests)
+      .set({ payload: buildPayload(existing.id), updatedAt: now })
+      .where(eq(schema.generationRequests.id, existing.id));
+    return existing.id;
+  }
+  const id = newId("gen");
+  await insertPendingGenerationRequest(db, {
+    id,
+    profileId,
+    kind,
+    payload: buildPayload(id),
+    now,
+  });
+  return id;
+}
+
+// The preparation item a generation request kind drives (null for the
+// kinds that have no preparation item: profile_apply, flavor_examples,
+// chara_chat_sync).
+function prepKeyForKind(
+  kind: GenRow["kind"],
+): "image" | "link_summary" | "greeting" | "video" | null {
+  switch (kind) {
+    case "image_generation":
+      return "image";
+    case "link_summary":
+      return "link_summary";
+    case "trial_conversation":
+      return "greeting";
+    case "video_transcript":
+      return "video";
+    default:
+      return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // CR-12: flavor example auto-generation (flavor_examples requests)
 // ---------------------------------------------------------------------------
 
@@ -1228,13 +1407,7 @@ function buildFlavorExamplesPayload(
     })),
     speech_style: data.speech.style,
     speech: mergedSpeechView(data),
-    speech_structured: {
-      first_person: data.speech.structured.first_person,
-      second_person: data.speech.structured.second_person,
-      call_user_as: data.call_user_as,
-      catchphrase: data.speech.structured.catchphrase,
-      memo: data.speech.structured.memo,
-    },
+    speech_structured: speechStructuredPayload(data),
     call_user_as: data.call_user_as,
     summary: data.summary,
     background_summary: data.background.link_summary,
@@ -1261,41 +1434,9 @@ async function queueFlavorExamplesRequest(
 ): Promise<string | null> {
   const targets = flavorExamplesTargets(data);
   if (targets.length === 0) return null;
-  const db = ctx.db<typeof schema>();
-  const payload = buildFlavorExamplesPayload(profileName, data, targets);
-  const open = await db
-    .select()
-    .from(schema.generationRequests)
-    .where(
-      and(
-        eq(schema.generationRequests.profileId, profileId),
-        eq(schema.generationRequests.kind, "flavor_examples"),
-      ),
-    );
-  const existing = open.find(
-    (r) => r.status === "pending" || r.status === "processing",
+  return upsertOpenGenerationRequest(ctx, profileId, "flavor_examples", () =>
+    buildFlavorExamplesPayload(profileName, data, targets),
   );
-  const now = new Date();
-  if (existing) {
-    await db
-      .update(schema.generationRequests)
-      .set({ payload, updatedAt: now })
-      .where(eq(schema.generationRequests.id, existing.id));
-    return existing.id;
-  }
-  const id = newId("gen");
-  await db.insert(schema.generationRequests).values({
-    id,
-    profileId,
-    kind: "flavor_examples",
-    payload,
-    status: "pending",
-    result: null,
-    reason: null,
-    createdAt: now,
-    updatedAt: now,
-  });
-  return id;
 }
 
 // Extract per-trait example lines from a flavor_examples write-back
@@ -1400,10 +1541,6 @@ function isYouTubePlaylistUrl(raw: string): boolean {
   return !!u.searchParams.get("list");
 }
 
-function youtubePlaylistUrls(urls: string[]): string[] {
-  return urls.filter(isYouTubePlaylistUrl);
-}
-
 // Video URLs of the profile that no video_transcript attempt has covered
 // yet — the ones that make a save queue (or refresh) a request.
 function unprocessedVideoUrls(data: ProfileData): string[] {
@@ -1425,13 +1562,10 @@ function buildVideoTranscriptPayload(
   unprocessed: string[],
   opts: { memoryRepair?: boolean } = {},
 ): string {
-  // CR-21: while the bias is failed it is inactive — the payload then
-  // carries no portrayal keys, exactly like an unused field.
-  const pf = portrayalEffectiveValue(data);
   const allVideoUrls = normalizeVideoUrls(data.background.video_urls);
   // CR-23: YouTube playlist URLs among the video URLs, flagged so the
   // chat side expands them (see playlist_note below).
-  const playlistUrls = youtubePlaylistUrls(allVideoUrls);
+  const playlistUrls = allVideoUrls.filter(isYouTubePlaylistUrl);
   return JSON.stringify({
     name: profileName,
     video_urls: allVideoUrls,
@@ -1458,21 +1592,11 @@ function buildVideoTranscriptPayload(
     ...(opts.memoryRepair ? portrayalMemoryRepairFields(data) : {}),
     // CR-19: only when 「演じる姿・状況」 is set — the transcript work
     // is restricted to the chapters/segments matching that portrayal.
-    ...(pf
-      ? {
-          portrayal_focus: pf,
-          background_portrayal_focus: pf,
-          portrayal_focus_note: portrayalVideoNote(pf),
-        }
-      : {}),
+    // CR-21: while the bias is failed it is inactive — the payload then
+    // carries no portrayal keys, exactly like an unused field.
+    ...portrayalFields(data, portrayalVideoNote),
     speech: mergedSpeechView(data),
-    speech_structured: {
-      first_person: data.speech.structured.first_person,
-      second_person: data.speech.structured.second_person,
-      call_user_as: data.call_user_as,
-      catchphrase: data.speech.structured.catchphrase,
-      memo: data.speech.structured.memo,
-    },
+    speech_structured: speechStructuredPayload(data),
     speech_sources: { ...data.speech.sources },
     manual_speech_fields: manualSpeechFields(data),
     existing_video_notes: data.background.video_notes ?? null,
@@ -1482,26 +1606,8 @@ function buildVideoTranscriptPayload(
     // flavor_traits and it is applied with the CR-20 merge rules.
     flavor: mergedFlavorView(data),
     flavor_level: (data.flavor ?? emptyFlavor).level,
-    flavor_traits: (data.flavor ?? emptyFlavor).traits.map((t) => ({
-      ...t,
-      examples: [...t.examples],
-      scenes: [...t.scenes],
-      frequency: t.frequency ?? null,
-      effective_frequency: effectiveFlavorFrequency(
-        t,
-        (data.flavor ?? emptyFlavor).level,
-      ),
-    })),
-    manual_flavor_traits: manualFlavorTraits(data).map((t) => ({
-      label: t.label,
-      examples: [...t.examples],
-      scenes: [...t.scenes],
-      frequency: t.frequency ?? null,
-      effective_frequency: effectiveFlavorFrequency(
-        t,
-        (data.flavor ?? emptyFlavor).level,
-      ),
-    })),
+    flavor_traits: flavorTraitsPayload(data),
+    manual_flavor_traits: manualFlavorTraitsPayload(data),
     flavor_note: FLAVOR_MERGE_NOTE,
     note: "video_urls は参考動画です。各動画の文字起こし（字幕／トランスクリプト）だけを取得してください。動画を再生・視聴する必要はありません。文字起こしは自動音声認識のことが多く誤認識を含みます。明らかな誤りは文脈で補正し、台詞をそのままの引用としてではなく、口癖・語尾・一人称／二人称など口調の材料として読んでください。話者の区切りが字幕にない場合は場面から推定してください。書き戻し result は {\"video_notes\": \"台詞から読み取れた口調の特徴の要約\", \"catchphrases\": [\"決まり文句・口癖の候補\", ...], \"unreadable_videos\": [\"文字起こしを取得できなかったURL\", ...]} の形で返してください。あわせて推定できた口調があれば first_person / second_person / memo / style などのキー（または speech オブジェクト）で含めて構いません。台詞から推定できるフレーバー項目があれば、result の flavor_traits（または flavor.traits）に {label, examples[], scenes[], enabled} の形で含めてください（フレーバーの反映は flavor_note のマージ規則どおりです）。取得できなかった動画は理由とともに unreadable_videos に入れてください（例: \"URL（字幕なし）\"）。manual_speech_fields に挙がった口調欄はユーザーの手動指定なので変更しないでください（サーバー側でも手動欄への反映は行われません）。口調の書き戻しはマージ規則（CR-18／CR-20）で反映されます：catchphrases（口癖）はサーバー側で既存の値と和集合マージされます（既存の口癖は消えません。新しい候補だけを返してください）。first_person / second_person は未設定のときだけ反映され、既に値がある場合は動画側の推定で上書きされません。memo / style を返す場合は、この payload の speech / speech_structured に含まれる既存の口調を土台に、その内容を消さず、動画の知見を統合した文章として返してください（返した文章がそのまま自動項目に反映されます）。",
   });
@@ -1529,43 +1635,16 @@ async function queueVideoTranscriptRequest(
   const unprocessed = opts.force ? urls : unprocessedVideoUrls(data);
   if (unprocessed.length === 0) return null;
   const db = ctx.db<typeof schema>();
-  const payload = buildVideoTranscriptPayload(profileName, data, unprocessed, {
-    memoryRepair: opts.memoryRepair,
-  });
-  const open = await db
-    .select()
-    .from(schema.generationRequests)
-    .where(
-      and(
-        eq(schema.generationRequests.profileId, profileId),
-        eq(schema.generationRequests.kind, "video_transcript"),
-      ),
-    );
-  const existing = open.find(
-    (r) => r.status === "pending" || r.status === "processing",
+  const requestId = await upsertOpenGenerationRequest(
+    ctx,
+    profileId,
+    "video_transcript",
+    () =>
+      buildVideoTranscriptPayload(profileName, data, unprocessed, {
+        memoryRepair: opts.memoryRepair,
+      }),
   );
   const now = new Date();
-  let requestId: string;
-  if (existing) {
-    await db
-      .update(schema.generationRequests)
-      .set({ payload, updatedAt: now })
-      .where(eq(schema.generationRequests.id, existing.id));
-    requestId = existing.id;
-  } else {
-    requestId = newId("gen");
-    await db.insert(schema.generationRequests).values({
-      id: requestId,
-      profileId,
-      kind: "video_transcript",
-      payload,
-      status: "pending",
-      result: null,
-      reason: null,
-      createdAt: now,
-      updatedAt: now,
-    });
-  }
   // A (re)queued attempt means the video item is 処理中 again: flip the
   // stored hint to pending and clear the previous failure reason (the
   // D-03 retry path, same as createGenerationRequest for other kinds).
@@ -2213,6 +2292,38 @@ function thumbKeyFor(sourceId: string): string {
 
 type ImageEntry = z.infer<typeof imageEntrySchema>;
 
+// Append an image entry to the profile's image list. When the new
+// entry becomes the primary image, every existing entry's is_primary
+// is cleared first; the appended entry's is_primary is makePrimary.
+// (image_base bookkeeping stays with the caller: which value becomes
+// image_ref differs per call site.)
+function appendImage(
+  data: ProfileData,
+  entry: Omit<ImageEntry, "is_primary"> & { is_primary?: boolean },
+  makePrimary: boolean,
+): void {
+  data.images = [
+    ...data.images.map((img) => ({
+      ...img,
+      is_primary: makePrimary ? false : img.is_primary,
+    })),
+    { ...entry, is_primary: makePrimary },
+  ];
+}
+
+// The profile's effective primary image entry: the entry flagged
+// is_primary, else the entry the image_base ref points at (matched by
+// blob_key or file). Undefined when neither exists.
+function findPrimaryImageEntry(data: ProfileData): ImageEntry | undefined {
+  const ref = data.image_base.image_ref;
+  return (
+    data.images.find((i) => i.is_primary) ??
+    (ref
+      ? data.images.find((i) => i.blob_key === ref || i.file === ref)
+      : undefined)
+  );
+}
+
 // Returns the thumbnail URL for one image entry, generating and storing
 // the thumbnail first when it does not exist yet. Best-effort: ANY
 // failure (no privileged declaration on the calling action, missing
@@ -2262,11 +2373,7 @@ async function pregeneratePrimaryThumb(
   data: ProfileData,
 ): Promise<void> {
   const ref = data.image_base.image_ref;
-  const primary =
-    data.images.find((i) => i.is_primary) ??
-    (ref
-      ? data.images.find((i) => i.blob_key === ref || i.file === ref)
-      : undefined);
+  const primary = findPrimaryImageEntry(data);
   if (primary) {
     await ensureThumbUrl(ctx, primary);
     return;
@@ -2274,6 +2381,75 @@ async function pregeneratePrimaryThumb(
   if (ref && /^https?:\/\//.test(ref)) {
     await ensureThumbUrl(ctx, { blob_key: null, file: ref, source: "url" });
   }
+}
+
+type PendingCounts = {
+  pending_switch_count: number;
+  pending_apply_count: number;
+};
+
+const ZERO_PENDING_COUNTS: PendingCounts = {
+  pending_switch_count: 0,
+  pending_apply_count: 0,
+};
+
+// S6 (R-4): pending counts for every profile from two batched queries
+// — the open (未完了) switch requests and the open profile_apply
+// generation requests, each read ONCE — returned as a Map keyed by
+// profile id for toProfileOut's `counts` option. Profiles with no open
+// requests are absent from the Map; callers fall back to
+// ZERO_PENDING_COUNTS, which matches the per-profile counts exactly.
+// (R-1: both reads fetch only open rows in SQL — status pending or
+// processing; the apply side is additionally narrowed to
+// kind = "profile_apply" — and the counting itself keeps the same
+// countOpen filter as listProfiles used before.)
+async function openCountsByProfile(
+  ctx: Ctx,
+): Promise<Map<string, PendingCounts>> {
+  const db = ctx.db<typeof schema>();
+  const swRows = await db
+    .select({
+      profileId: schema.switchRequests.profileId,
+      status: schema.switchRequests.status,
+    })
+    .from(schema.switchRequests)
+    .where(
+      or(
+        eq(schema.switchRequests.status, "pending"),
+        eq(schema.switchRequests.status, "processing"),
+      ),
+    );
+  const applyRows = await db
+    .select({
+      profileId: schema.generationRequests.profileId,
+      status: schema.generationRequests.status,
+    })
+    .from(schema.generationRequests)
+    .where(
+      and(
+        eq(schema.generationRequests.kind, "profile_apply"),
+        or(
+          eq(schema.generationRequests.status, "pending"),
+          eq(schema.generationRequests.status, "processing"),
+        ),
+      ),
+    );
+  const countOpen = (
+    rows: { profileId: string | null; status: string }[],
+    id: string,
+  ) =>
+    rows.filter((r) => r.profileId === id && isOpenStatus(r.status)).length;
+  const ids = new Set<string>();
+  for (const r of swRows) ids.add(r.profileId);
+  for (const r of applyRows) if (r.profileId) ids.add(r.profileId);
+  const counts = new Map<string, PendingCounts>();
+  for (const id of ids) {
+    counts.set(id, {
+      pending_switch_count: countOpen(swRows, id),
+      pending_apply_count: countOpen(applyRows, id),
+    });
+  }
+  return counts;
 }
 
 async function toProfileOut(
@@ -2299,9 +2475,7 @@ async function toProfileOut(
       .select({ status: schema.switchRequests.status })
       .from(schema.switchRequests)
       .where(eq(schema.switchRequests.profileId, row.id));
-    pending_switch_count = swRows.filter(
-      (r) => r.status === "pending" || r.status === "processing",
-    ).length;
+    pending_switch_count = swRows.filter((r) => isOpenStatus(r.status)).length;
     const genRows = await db
       .select({ status: schema.generationRequests.status })
       .from(schema.generationRequests)
@@ -2311,19 +2485,13 @@ async function toProfileOut(
           eq(schema.generationRequests.kind, "profile_apply"),
         ),
       );
-    pending_apply_count = genRows.filter(
-      (r) => r.status === "pending" || r.status === "processing",
-    ).length;
+    pending_apply_count = genRows.filter((r) => isOpenStatus(r.status)).length;
   }
   // The effective primary image, mirroring the client's
   // primaryImageSrc: the entry flagged is_primary, else the entry the
   // image_base ref points at.
   const ref = data.image_base.image_ref;
-  const primaryEntry =
-    data.images.find((i) => i.is_primary) ??
-    (ref
-      ? data.images.find((i) => i.blob_key === ref || i.file === ref)
-      : undefined);
+  const primaryEntry = findPrimaryImageEntry(data);
   const mapImage = async (
     img: ImageEntry,
   ): Promise<z.infer<typeof profileOutSchema>["images"][number]> => {
@@ -2442,11 +2610,12 @@ async function pushHistory(
     .from(schema.profileHistory)
     .where(eq(schema.profileHistory.profileId, row.id))
     .orderBy(desc(schema.profileHistory.id));
-  const extra = versions.slice(20);
-  for (const v of extra) {
+  // S6 (R-9): prune the overflow in ONE delete instead of one per row.
+  const extraIds = versions.slice(20).map((v) => v.id);
+  if (extraIds.length > 0) {
     await db
       .delete(schema.profileHistory)
-      .where(eq(schema.profileHistory.id, v.id));
+      .where(inArray(schema.profileHistory.id, extraIds));
   }
 }
 
@@ -2519,18 +2688,15 @@ function applyPhrase(profileName: string, requestId: string): string {
   return `アバター総合管理で「${profileName}」のプロファイル更新の即時反映リクエストを作成しました（リクエストID: ${requestId}）。反映を処理してください。`;
 }
 
-async function toSwitchOut(
-  ctx: Ctx,
+// The switch-request output assembly, shared by toSwitchOutMany's
+// batched path: given the request row, the resolved profile name, and
+// the parsed profile data (null when the profile is gone), it builds
+// exactly the output the former per-row toSwitchOut produced.
+function buildSwitchOut(
   row: SwitchRow,
-): Promise<z.infer<typeof switchRequestOut>> {
-  const db = ctx.db<typeof schema>();
-  const profs = await db
-    .select({ name: schema.profiles.name, data: schema.profiles.data })
-    .from(schema.profiles)
-    .where(eq(schema.profiles.id, row.profileId))
-    .limit(1);
-  const name = profs[0]?.name ?? "(削除済み)";
-  const profData = profs[0] ? parseData(profs[0].data) : null;
+  name: string,
+  profData: ProfileData | null,
+): z.infer<typeof switchRequestOut> {
   const userRelationship = profData
     ? (profData.background.user_relationship ?? null)
     : null;
@@ -2554,6 +2720,37 @@ async function toSwitchOut(
     created_at: row.createdAt.toISOString(),
     updated_at: row.updatedAt.toISOString(),
   };
+}
+
+// S6 (R-2): batch form of the former toSwitchOut — resolves every
+// referenced profile with ONE inArray query instead of one query per
+// request, then assembles each row exactly like toSwitchOut did (a
+// profile that no longer exists is named "(削除済み)"). The output
+// order is the input rows' order.
+async function toSwitchOutMany(
+  ctx: Ctx,
+  rows: SwitchRow[],
+): Promise<z.infer<typeof switchRequestOut>[]> {
+  if (rows.length === 0) return [];
+  const db = ctx.db<typeof schema>();
+  const ids = [...new Set(rows.map((r) => r.profileId))];
+  const profs = await db
+    .select({
+      id: schema.profiles.id,
+      name: schema.profiles.name,
+      data: schema.profiles.data,
+    })
+    .from(schema.profiles)
+    .where(inArray(schema.profiles.id, ids));
+  const byId = new Map(profs.map((p) => [p.id, p]));
+  return rows.map((row) => {
+    const prof = byId.get(row.profileId);
+    return buildSwitchOut(
+      row,
+      prof?.name ?? "(削除済み)",
+      prof ? parseData(prof.data) : null,
+    );
+  });
 }
 
 const generationRequestOut = z.object({
@@ -2583,20 +2780,14 @@ const generationRequestOut = z.object({
 
 type GenRow = typeof schema.generationRequests.$inferSelect;
 
-async function toGenOut(
-  ctx: Ctx,
+// The generation-request output assembly, shared by toGenOutMany's
+// batched path: given the request row and the resolved profile name
+// (null when the request has no profile or it no longer exists), it
+// builds exactly the output the former per-row toGenOut produced.
+function buildGenOut(
   row: GenRow,
-): Promise<z.infer<typeof generationRequestOut>> {
-  const db = ctx.db<typeof schema>();
-  let name: string | null = null;
-  if (row.profileId) {
-    const profs = await db
-      .select({ name: schema.profiles.name })
-      .from(schema.profiles)
-      .where(eq(schema.profiles.id, row.profileId))
-      .limit(1);
-    name = profs[0]?.name ?? null;
-  }
+  name: string | null,
+): z.infer<typeof generationRequestOut> {
   return {
     id: row.id,
     profile_id: row.profileId,
@@ -2611,6 +2802,38 @@ async function toGenOut(
     created_at: row.createdAt.toISOString(),
     updated_at: row.updatedAt.toISOString(),
   };
+}
+
+// S6 (R-3): batch form of the former toGenOut — resolves every
+// referenced profile name with ONE inArray query instead of one query
+// per request, then assembles each row exactly like toGenOut did. The
+// output order is the input rows' order.
+async function toGenOutMany(
+  ctx: Ctx,
+  rows: GenRow[],
+): Promise<z.infer<typeof generationRequestOut>[]> {
+  const ids = [
+    ...new Set(
+      rows
+        .map((r) => r.profileId)
+        .filter((id): id is string => id !== null),
+    ),
+  ];
+  const nameById = new Map<string, string>();
+  if (ids.length > 0) {
+    const db = ctx.db<typeof schema>();
+    const profs = await db
+      .select({ id: schema.profiles.id, name: schema.profiles.name })
+      .from(schema.profiles)
+      .where(inArray(schema.profiles.id, ids));
+    for (const p of profs) nameById.set(p.id, p.name);
+  }
+  return rows.map((row) =>
+    buildGenOut(
+      row,
+      row.profileId ? (nameById.get(row.profileId) ?? null) : null,
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -2655,6 +2878,7 @@ async function discoverCharaImportTarget(
       privileged.findProfileImportTarget,
       {
         self_slug: ctx.slug,
+        space_dir: ctx.spaceDir,
         handshake_action: CHARA_RECEIVER_HANDSHAKE_ACTION,
         required_actions: [...CHARA_IMPORT_REQUIRED_ACTIONS],
       },
@@ -2705,49 +2929,22 @@ async function queueCharaChatSyncRequest(
   profileUpdatedAt: string,
   target: CharaImportTarget,
 ): Promise<string> {
-  const db = ctx.db<typeof schema>();
-  const open = await db
-    .select()
-    .from(schema.generationRequests)
-    .where(
-      and(
-        eq(schema.generationRequests.profileId, profileId),
-        eq(schema.generationRequests.kind, "chara_chat_sync"),
-      ),
-    );
-  const existing = open.find(
-    (r) => r.status === "pending" || r.status === "processing",
+  const requestId = await upsertOpenGenerationRequest(
+    ctx,
+    profileId,
+    "chara_chat_sync",
+    (id) =>
+      JSON.stringify({
+        profile_id: profileId,
+        name: profileName,
+        profile_updated_at: profileUpdatedAt,
+        source_slug: ctx.slug,
+        target_slug: target.slug,
+        target_name: target.name,
+        target_method: target.method,
+        note: charaSyncProcedure(ctx.slug, target, profileId, id),
+      }),
   );
-  const now = new Date();
-  const requestId = existing ? existing.id : newId("gen");
-  const payload = JSON.stringify({
-    profile_id: profileId,
-    name: profileName,
-    profile_updated_at: profileUpdatedAt,
-    source_slug: ctx.slug,
-    target_slug: target.slug,
-    target_name: target.name,
-    target_method: target.method,
-    note: charaSyncProcedure(ctx.slug, target, profileId, requestId),
-  });
-  if (existing) {
-    await db
-      .update(schema.generationRequests)
-      .set({ payload, updatedAt: now })
-      .where(eq(schema.generationRequests.id, existing.id));
-  } else {
-    await db.insert(schema.generationRequests).values({
-      id: requestId,
-      profileId,
-      kind: "chara_chat_sync",
-      payload,
-      status: "pending",
-      result: null,
-      reason: null,
-      createdAt: now,
-      updatedAt: now,
-    });
-  }
   // Kick the mediator immediately. A failed kick is not an error: the
   // queued request remains for the polling safety net.
   try {
@@ -2762,6 +2959,73 @@ async function queueCharaChatSyncRequest(
     // The request row above is the durable record; ignore kick errors.
   }
   return requestId;
+}
+
+// Discover the chara-chat import target and, when one is found, queue
+// (or refresh) the profile's chara_chat_sync request against it (the
+// queue helper kicks the mediator). Returns the queued request id and
+// the discovered target slug, or null when no target is discovered in
+// this environment — callers then simply skip the sync and their own
+// operation is unaffected.
+async function queueCharaSyncIfTargetFound(
+  ctx: Ctx,
+  profileId: string,
+  name: string,
+  updatedAtIso: string,
+): Promise<{ requestId: string; targetSlug: string } | null> {
+  const target = await discoverCharaImportTarget(ctx);
+  if (!target) return null;
+  const requestId = await queueCharaChatSyncRequest(
+    ctx,
+    profileId,
+    name,
+    updatedAtIso,
+    target,
+  );
+  return { requestId, targetSlug: target.slug };
+}
+
+// The post-creation queueing shared by createProfile and
+// registerProfile, in this exact order: reload the stored row,
+// pre-generate the primary image's thumbnail (CR-25), queue
+// flavor_examples for traits that need them (CR-12), queue
+// video_transcript for uncovered reference videos (CR-17), and — only
+// when syncToCharaChat is true — queue the chara_chat_sync reflection
+// against a discovered target (CR-24).
+async function runPostCreateTasks(
+  ctx: Ctx,
+  id: string,
+  syncToCharaChat: boolean,
+): Promise<{
+  videoRequestId: string | null;
+  charaSyncRequestId: string | null;
+  charaTargetSlug: string | null;
+}> {
+  const row = await getRow(ctx, id);
+  const data = parseData(row.data);
+  await pregeneratePrimaryThumb(ctx, data);
+  await queueFlavorExamplesRequest(ctx, id, row.name, data);
+  const videoRequestId = await queueVideoTranscriptRequest(
+    ctx,
+    id,
+    row.name,
+    data,
+  );
+  let charaSyncRequestId: string | null = null;
+  let charaTargetSlug: string | null = null;
+  if (syncToCharaChat) {
+    const synced = await queueCharaSyncIfTargetFound(
+      ctx,
+      id,
+      row.name,
+      row.updatedAt.toISOString(),
+    );
+    if (synced) {
+      charaSyncRequestId = synced.requestId;
+      charaTargetSlug = synced.targetSlug;
+    }
+  }
+  return { videoRequestId, charaSyncRequestId, charaTargetSlug };
 }
 
 async function insertProfile(
@@ -2832,36 +3096,15 @@ export const Actions = {
       });
       // CR-25: pending counts for the whole list from two batched
       // queries (previously two queries PER profile in toProfileOut).
-      const allSwitchRows = await db
-        .select({
-          profileId: schema.switchRequests.profileId,
-          status: schema.switchRequests.status,
-        })
-        .from(schema.switchRequests);
-      const allApplyRows = await db
-        .select({
-          profileId: schema.generationRequests.profileId,
-          status: schema.generationRequests.status,
-        })
-        .from(schema.generationRequests)
-        .where(eq(schema.generationRequests.kind, "profile_apply"));
-      const countOpen = (
-        rows: { profileId: string | null; status: string }[],
-        id: string,
-      ) =>
-        rows.filter(
-          (r) =>
-            r.profileId === id &&
-            (r.status === "pending" || r.status === "processing"),
-        ).length;
+      // S6 (R-4): those batched counts now come from
+      // openCountsByProfile, whose reads fetch only the open rows in
+      // SQL (R-1) and whose counting keeps the countOpen filter.
+      const countsByProfile = await openCountsByProfile(ctx);
       const profiles = await Promise.all(
         sorted.map((r) =>
           toProfileOut(ctx, r, {
             light: true,
-            counts: {
-              pending_switch_count: countOpen(allSwitchRows, r.id),
-              pending_apply_count: countOpen(allApplyRows, r.id),
-            },
+            counts: countsByProfile.get(r.id) ?? ZERO_PENDING_COUNTS,
           }),
         ),
       );
@@ -2871,9 +3114,7 @@ export const Actions = {
         .from(schema.switchRequests)
         .orderBy(desc(schema.switchRequests.createdAt))
         .limit(5);
-      const switch_requests = await Promise.all(
-        reqRows.map((r) => toSwitchOut(ctx, r)),
-      );
+      const switch_requests = await toSwitchOutMany(ctx, reqRows);
       return { profiles, active_id: active?.id ?? null, switch_requests };
     },
   }),
@@ -2909,37 +3150,11 @@ export const Actions = {
           ? args.data
           : { ...args.data, chara_chat_sync: args.sync_to_chara_chat };
       const id = await insertProfile(ctx, args.name, dataIn, { favorite: args.favorite });
-      // CR-12: traits saved with 「例文を自動作成」 on and no examples
-      // get a flavor_examples request right away.
-      const row = await getRow(ctx, id);
-      const data = parseData(row.data);
-      // CR-25: pre-generate the primary image's thumbnail at creation
-      // time (URL-specified images included) so the list opens light.
-      await pregeneratePrimaryThumb(ctx, data);
-      await queueFlavorExamplesRequest(ctx, id, row.name, data);
-      // CR-17: unprocessed reference videos queue one transcript request.
-      const videoRequestId = await queueVideoTranscriptRequest(
-        ctx,
-        id,
-        row.name,
-        data,
-      );
-      // CR-24: reflect into the discovered chara-chat app right away.
-      let charaSyncRequestId: string | null = null;
-      let charaTargetSlug: string | null = null;
-      if (args.sync_to_chara_chat) {
-        const target = await discoverCharaImportTarget(ctx);
-        if (target) {
-          charaTargetSlug = target.slug;
-          charaSyncRequestId = await queueCharaChatSyncRequest(
-            ctx,
-            id,
-            row.name,
-            row.updatedAt.toISOString(),
-            target,
-          );
-        }
-      }
+      // Post-creation queueing (CR-12 flavor_examples, CR-25 thumbnail
+      // pre-generation, CR-17 video_transcript, CR-24 chara_chat_sync),
+      // shared with registerProfile — see runPostCreateTasks.
+      const { videoRequestId, charaSyncRequestId, charaTargetSlug } =
+        await runPostCreateTasks(ctx, id, !!args.sync_to_chara_chat);
       ctx.invalidateQueries();
       return {
         id,
@@ -2986,29 +3201,13 @@ export const Actions = {
         origin: { ...args.data.origin, type: "auto_saved" },
       };
       const id = await insertProfile(ctx, args.name, data);
-      // CR-12: same flavor_examples queueing as createProfile.
-      const row = await getRow(ctx, id);
-      const parsed = parseData(row.data);
-      // CR-25: pre-generate the primary image's thumbnail at
-      // registration time, same as createProfile.
-      await pregeneratePrimaryThumb(ctx, parsed);
-      await queueFlavorExamplesRequest(ctx, id, row.name, parsed);
-      // CR-17: same video_transcript queueing as createProfile.
-      await queueVideoTranscriptRequest(ctx, id, row.name, parsed);
-      // CR-24: same chara_chat_sync queueing as createProfile.
-      let charaSyncRequestId: string | null = null;
-      if (args.sync_to_chara_chat) {
-        const target = await discoverCharaImportTarget(ctx);
-        if (target) {
-          charaSyncRequestId = await queueCharaChatSyncRequest(
-            ctx,
-            id,
-            row.name,
-            row.updatedAt.toISOString(),
-            target,
-          );
-        }
-      }
+      // Same post-creation queueing as createProfile (the
+      // video_transcript request id is not part of this response).
+      const { charaSyncRequestId } = await runPostCreateTasks(
+        ctx,
+        id,
+        !!args.sync_to_chara_chat,
+      );
       ctx.invalidateQueries();
       return { id, duplicate: false, chara_chat_sync_request_id: charaSyncRequestId };
     },
@@ -3183,7 +3382,7 @@ export const Actions = {
         })
         .where(eq(schema.profiles.id, args.id));
       if (requeue) {
-        await db.insert(schema.generationRequests).values({
+        await insertPendingGenerationRequest(db, {
           id: newId("gen"),
           profileId: args.id,
           kind: "link_summary",
@@ -3209,13 +3408,7 @@ export const Actions = {
               ? portrayalMemoryRepairFields(clean)
               : {}),
             speech: mergedSpeechView(clean),
-            speech_structured: {
-              first_person: clean.speech.structured.first_person,
-              second_person: clean.speech.structured.second_person,
-              call_user_as: clean.call_user_as,
-              catchphrase: clean.speech.structured.catchphrase,
-              memo: clean.speech.structured.memo,
-            },
+            speech_structured: speechStructuredPayload(clean),
             speech_sources: { ...clean.speech.sources },
             manual_speech_fields: manualSpeechFields(clean),
             // CR-20: the speech write-back follows the same merge rules
@@ -3230,27 +3423,14 @@ export const Actions = {
             // and effective_frequency (frequency ?? level).
             flavor: mergedFlavorView(clean),
             flavor_level: clean.flavor.level,
-            flavor_traits: (clean.flavor?.traits ?? []).map((t) => ({
-              ...t,
-              effective_frequency: effectiveFlavorFrequency(t, clean.flavor.level),
-            })),
-            manual_flavor_traits: manualFlavorTraits(clean).map((t) => ({
-              label: t.label,
-              examples: [...t.examples],
-              scenes: [...t.scenes],
-              frequency: t.frequency ?? null,
-              effective_frequency: effectiveFlavorFrequency(t, clean.flavor.level),
-            })),
+            flavor_traits: flavorTraitsPayload(clean),
+            manual_flavor_traits: manualFlavorTraitsPayload(clean),
             flavor_note:
               "フレーバー項目を背景リンクから推定できる場合は、書き戻し result の flavor_traits（または flavor.traits）に含めてください。各項目は {label, examples[], scenes[], enabled} の形です。" +
               FLAVOR_MERGE_NOTE +
               " CR-14: 各項目には frequency（項目ごとの頻度、null=全体に従う）と effective_frequency（実効頻度 = frequency ?? level）が付きます。実効頻度0の項目は出さないでください。",
           }),
-          status: "pending",
-          result: null,
-          reason: null,
-          createdAt: now,
-          updatedAt: now,
+          now,
         });
       }
       // CR-12: flavor traits with auto_examples on and no examples yet
@@ -3286,7 +3466,7 @@ export const Actions = {
           const primary =
             clean.images.find((i) => i.is_primary) ?? clean.images[0] ?? null;
           apply_request_id = newId("gen");
-          await db.insert(schema.generationRequests).values({
+          await insertPendingGenerationRequest(db, {
             id: apply_request_id,
             profileId: args.id,
             kind: "profile_apply",
@@ -3317,14 +3497,9 @@ export const Actions = {
               // fields. Stored values already are the merge result, and
               // the chat side treats this as authoritative for tone.
               speech: mergedSpeechView(clean),
-              speech_structured: {
-                first_person: clean.speech.structured.first_person,
-                second_person: clean.speech.structured.second_person,
-                call_user_as: clean.call_user_as,
-                catchphrase: clean.speech.structured.catchphrase,
-                memo: clean.speech.structured.memo,
-                style: clean.speech.style,
-              },
+              speech_structured: speechStructuredPayload(clean, {
+                withStyle: true,
+              }),
               speech_sources: { ...clean.speech.sources },
               // CR-07: 「私の扱い」 is authoritative for how the avatar
               // treats the user after applying (master/servant, equal
@@ -3359,11 +3534,7 @@ export const Actions = {
                   ? ` ${portrayalActingNote(portrayalEffectiveValue(clean) as string)}`
                   : ""),
             }),
-            status: "pending",
-            result: null,
-            reason: null,
-            createdAt: now,
-            updatedAt: now,
+            now,
           });
           apply_kind = "profile_apply";
         } else {
@@ -3387,16 +3558,15 @@ export const Actions = {
       let charaSyncRequestId: string | null = null;
       let charaTargetSlug: string | null = null;
       if (args.sync_to_chara_chat && !row.deletedAt) {
-        const target = await discoverCharaImportTarget(ctx);
-        if (target) {
-          charaTargetSlug = target.slug;
-          charaSyncRequestId = await queueCharaChatSyncRequest(
-            ctx,
-            args.id,
-            args.name,
-            now.toISOString(),
-            target,
-          );
+        const synced = await queueCharaSyncIfTargetFound(
+          ctx,
+          args.id,
+          args.name,
+          now.toISOString(),
+        );
+        if (synced) {
+          charaSyncRequestId = synced.requestId;
+          charaTargetSlug = synced.targetSlug;
         }
       }
       // CR-25: pre-generate the (possibly changed) primary image's
@@ -3404,8 +3574,10 @@ export const Actions = {
       // the list never generates on open. Best-effort; skipped for
       // trashed profiles.
       if (!row.deletedAt) {
-        const savedRow = await getRow(ctx, args.id);
-        await pregeneratePrimaryThumb(ctx, parseData(savedRow.data));
+        // S6 (R-8): the row just written holds exactly
+        // JSON.stringify(clean), so parse that string directly instead
+        // of re-reading the row with getRow — the result is identical.
+        await pregeneratePrimaryThumb(ctx, parseData(JSON.stringify(clean)));
       }
       ctx.invalidateQueries();
       return {
@@ -3487,8 +3659,15 @@ export const Actions = {
         .from(schema.profiles)
         .orderBy(desc(schema.profiles.deletedAt));
       const deleted = rows.filter((r) => r.deletedAt != null);
+      // S6 (R-4): pending counts from the batched openCountsByProfile
+      // (full form — the trash list does not use the light form).
+      const countsByProfile = await openCountsByProfile(ctx);
       const profiles = await Promise.all(
-        deleted.map((r) => toProfileOut(ctx, r)),
+        deleted.map((r) =>
+          toProfileOut(ctx, r, {
+            counts: countsByProfile.get(r.id) ?? ZERO_PENDING_COUNTS,
+          }),
+        ),
       );
       return { profiles };
     },
@@ -3555,29 +3734,15 @@ export const Actions = {
       const data = parseData(row.data);
       const imageId = newId("im");
       const makePrimary = args.make_primary || data.images.length === 0;
-      data.images = [
-        ...data.images.map((img) => ({
-          ...img,
-          is_primary: makePrimary ? false : img.is_primary,
-        })),
-        {
-          id: imageId,
-          file: key,
-          blob_key: key,
-          is_primary: makePrimary,
-          source: "upload",
-        },
-      ];
+      appendImage(
+        data,
+        { id: imageId, file: key, blob_key: key, source: "upload" },
+        makePrimary,
+      );
       data.image_base = { ...data.image_base, type: "image", image_ref: key };
       // CR-10: a new representative image re-acquires the theme color
       // from the image — except when the user picked it manually.
-      if (
-        isValidThemeColor(args.theme_color_candidate) &&
-        data.theme_color_source !== "manual"
-      ) {
-        data.theme_color = (args.theme_color_candidate as string).toLowerCase();
-        data.theme_color_source = "auto";
-      }
+      applyThemeColorCandidate(data, args.theme_color_candidate);
       // Registering a replacement image is one of the A-09 alternatives:
       // it clears a previous image-generation failure (D-03).
       data.preparation = { ...data.preparation, image: "done" };
@@ -3611,32 +3776,18 @@ export const Actions = {
       const data = parseData(row.data);
       const imageId = newId("im");
       const makePrimary = args.make_primary || data.images.length === 0;
-      data.images = [
-        ...data.images.map((img) => ({
-          ...img,
-          is_primary: makePrimary ? false : img.is_primary,
-        })),
-        {
-          id: imageId,
-          file: args.url,
-          blob_key: null,
-          is_primary: makePrimary,
-          source: "url",
-        },
-      ];
+      appendImage(
+        data,
+        { id: imageId, file: args.url, blob_key: null, source: "url" },
+        makePrimary,
+      );
       data.image_base = {
         ...data.image_base,
         type: "image",
         image_ref: args.url,
       };
       // CR-10: same manual-priority theme re-acquisition as uploadImage.
-      if (
-        isValidThemeColor(args.theme_color_candidate) &&
-        data.theme_color_source !== "manual"
-      ) {
-        data.theme_color = (args.theme_color_candidate as string).toLowerCase();
-        data.theme_color_source = "auto";
-      }
+      applyThemeColorCandidate(data, args.theme_color_candidate);
       data.preparation = { ...data.preparation, image: "done" };
       data.preparation_errors = { ...data.preparation_errors, image: null };
       const withPrep2 = withPreparation(data);
@@ -3673,13 +3824,7 @@ export const Actions = {
         ...img,
         is_primary: img.id === args.image_id,
       }));
-      if (
-        isValidThemeColor(args.theme_color_candidate) &&
-        data.theme_color_source !== "manual"
-      ) {
-        data.theme_color = (args.theme_color_candidate as string).toLowerCase();
-        data.theme_color_source = "auto";
-      }
+      applyThemeColorCandidate(data, args.theme_color_candidate);
       await db
         .update(schema.profiles)
         .set({ data: JSON.stringify(data), updatedAt: new Date() })
@@ -3866,10 +4011,8 @@ export const Actions = {
         .select()
         .from(schema.switchRequests)
         .orderBy(schema.switchRequests.createdAt);
-      const open = rows.filter(
-        (r) => r.status === "pending" || r.status === "processing",
-      );
-      const requests = await Promise.all(open.map((r) => toSwitchOut(ctx, r)));
+      const open = rows.filter((r) => isOpenStatus(r.status));
+      const requests = await toSwitchOutMany(ctx, open);
       return { requests };
     },
   }),
@@ -3985,12 +4128,8 @@ export const Actions = {
         .from(schema.switchRequests)
         .orderBy(desc(schema.switchRequests.createdAt))
         .limit(10);
-      const open = reqRows.filter(
-        (r) => r.status === "pending" || r.status === "processing",
-      );
-      const open_requests = await Promise.all(
-        open.map((r) => toSwitchOut(ctx, r)),
-      );
+      const open = reqRows.filter((r) => isOpenStatus(r.status));
+      const open_requests = await toSwitchOutMany(ctx, open);
       return { active, open_requests };
     },
   }),
@@ -4097,23 +4236,11 @@ export const Actions = {
         // without touching manual ones.
         if (args.kind === "link_summary" || args.kind === "trial_conversation") {
           const data = parseData(row.data);
-          let obj: Record<string, unknown> = {};
-          try {
-            const p = JSON.parse(args.payload) as unknown;
-            if (p && typeof p === "object" && !Array.isArray(p)) {
-              obj = p as Record<string, unknown>;
-            }
-          } catch {
-            obj = { note: args.payload };
-          }
+          const obj: Record<string, unknown> = parsePayloadObject(
+            args.payload,
+          );
           obj.speech = mergedSpeechView(data);
-          obj.speech_structured = {
-            first_person: data.speech.structured.first_person,
-            second_person: data.speech.structured.second_person,
-            call_user_as: data.call_user_as,
-            catchphrase: data.speech.structured.catchphrase,
-            memo: data.speech.structured.memo,
-          };
+          obj.speech_structured = speechStructuredPayload(data);
           obj.speech_sources = { ...data.speech.sources };
           obj.manual_speech_fields = manualSpeechFields(data);
           // CR-07: 「私の扱い」 — the relationship specification the
@@ -4148,26 +4275,8 @@ export const Actions = {
           // change it in a write-back.
           obj.flavor = mergedFlavorView(data);
           obj.flavor_level = (data.flavor ?? emptyFlavor).level;
-          obj.flavor_traits = (data.flavor ?? emptyFlavor).traits.map((t) => ({
-            ...t,
-            examples: [...t.examples],
-            scenes: [...t.scenes],
-            frequency: t.frequency ?? null,
-            effective_frequency: effectiveFlavorFrequency(
-              t,
-              (data.flavor ?? emptyFlavor).level,
-            ),
-          }));
-          obj.manual_flavor_traits = manualFlavorTraits(data).map((t) => ({
-            label: t.label,
-            examples: [...t.examples],
-            scenes: [...t.scenes],
-            frequency: t.frequency ?? null,
-            effective_frequency: effectiveFlavorFrequency(
-              t,
-              (data.flavor ?? emptyFlavor).level,
-            ),
-          }));
+          obj.flavor_traits = flavorTraitsPayload(data);
+          obj.manual_flavor_traits = manualFlavorTraitsPayload(data);
           obj.flavor_note =
             "フレーバー項目（キャラクターらしさ）です。背景URLや名前から推定できる項目は、書き戻し result の flavor_traits（または flavor.traits）に {label, examples[], scenes[], enabled} の形で含めてください。" +
             FLAVOR_MERGE_NOTE +
@@ -4179,15 +4288,15 @@ export const Actions = {
           // are added and the payload is exactly as before.
           // CR-21: while the bias is failed it is inactive — no
           // portrayal keys either (portrayalEffectiveValue is null).
-          const pf = portrayalEffectiveValue(data);
-          if (pf) {
-            obj.portrayal_focus = pf;
-            obj.background_portrayal_focus = pf;
-            obj.portrayal_focus_note =
+          Object.assign(
+            obj,
+            portrayalFields(
+              data,
               args.kind === "trial_conversation"
-                ? portrayalActingNote(pf)
-                : portrayalGenerationNote(pf);
-          }
+                ? portrayalActingNote
+                : portrayalGenerationNote,
+            ),
+          );
           // CR-22: trial_conversation is an acting kind, so its
           // payload always carries the standing address note.
           // link_summary is generation and must NOT carry it.
@@ -4201,15 +4310,9 @@ export const Actions = {
         // (the canonical path — updateProfile with apply_now — adds
         // it when building the payload there).
         if (args.kind === "profile_apply") {
-          let obj: Record<string, unknown> = {};
-          try {
-            const p = JSON.parse(args.payload) as unknown;
-            if (p && typeof p === "object" && !Array.isArray(p)) {
-              obj = p as Record<string, unknown>;
-            }
-          } catch {
-            obj = { note: args.payload };
-          }
+          const obj: Record<string, unknown> = parsePayloadObject(
+            args.payload,
+          );
           obj.address_note = ADDRESS_NOTE;
           payload = JSON.stringify(obj);
         }
@@ -4222,34 +4325,22 @@ export const Actions = {
           const data = parseData(row.data);
           const pf = portrayalEffectiveValue(data);
           if (pf) {
-            let obj: Record<string, unknown> = {};
-            try {
-              const p = JSON.parse(args.payload) as unknown;
-              if (p && typeof p === "object" && !Array.isArray(p)) {
-                obj = p as Record<string, unknown>;
-              }
-            } catch {
-              obj = { note: args.payload };
-            }
-            obj.portrayal_focus = pf;
-            obj.background_portrayal_focus = pf;
-            obj.portrayal_focus_note = portrayalImageNote(pf);
+            const obj: Record<string, unknown> = parsePayloadObject(
+              args.payload,
+            );
+            Object.assign(obj, portrayalFields(data, portrayalImageNote));
             payload = JSON.stringify(obj);
           }
         }
       }
       const id = newId("gen");
       const now = new Date();
-      await db.insert(schema.generationRequests).values({
+      await insertPendingGenerationRequest(db, {
         id,
         profileId: args.profile_id,
         kind: args.kind,
         payload,
-        status: "pending",
-        result: null,
-        reason: null,
-        createdAt: now,
-        updatedAt: now,
+        now,
       });
       // Mark preparation as pending for the corresponding item.
       // profile_apply (CR-03) has no preparation item, so it never touches
@@ -4265,10 +4356,6 @@ export const Actions = {
           if (args.kind === "image_generation") { prep.image = "pending"; errors.image = null; }
           if (args.kind === "link_summary") { prep.link_summary = "pending"; errors.link_summary = null; }
           if (args.kind === "trial_conversation") { prep.greeting = "pending"; errors.greeting = null; }
-          prep.status =
-            prep.image === "failed" || prep.link_summary === "failed" || prep.greeting === "failed"
-              ? "needs_attention"
-              : "preparing";
           data.preparation = prep;
           data.preparation_errors = errors;
           await db.update(schema.profiles).set({ data: JSON.stringify(data), updatedAt: now }).where(eq(schema.profiles.id, args.profile_id));
@@ -4304,11 +4391,9 @@ export const Actions = {
       if (args.profile_id)
         rows = rows.filter((r) => r.profileId === args.profile_id);
       if (args.only_open)
-        rows = rows.filter(
-          (r) => r.status === "pending" || r.status === "processing",
-        );
+        rows = rows.filter((r) => isOpenStatus(r.status));
       rows = rows.slice(0, args.limit);
-      const requests = await Promise.all(rows.map((r) => toGenOut(ctx, r)));
+      const requests = await toGenOutMany(ctx, rows);
       return { requests };
     },
   }),
@@ -4415,12 +4500,7 @@ export const Actions = {
           // request was in flight survive) and touch only this kind's own
           // fields plus its own preparation item.
           const data = parseData(prof[0].data);
-          const kindKey =
-            req.kind === "image_generation"
-              ? "image"
-              : req.kind === "link_summary"
-                ? "link_summary"
-                : "greeting";
+          const kindKey = prepKeyForKind(req.kind);
           if (args.status === "completed") {
             // CR-06: a link_summary / trial_conversation write-back may
             // carry structured speech fields (flat or nested in the
@@ -4498,15 +4578,7 @@ export const Actions = {
               // the specification-derived elements and kept the other
               // facts). No returned avatar_memory — or an empty one —
               // keeps the stored memory exactly as it was.
-              if (
-                memoryRepairRequested &&
-                typeof parsed.avatar_memory === "string" &&
-                parsed.avatar_memory.trim()
-              ) {
-                data.avatar_memory = parsed.avatar_memory
-                  .trim()
-                  .slice(0, 20000);
-              }
+              applyAvatarMemoryRepair(data, parsed, memoryRepairRequested);
             }
             if (req.kind === "image_generation") {
               const file =
@@ -4515,22 +4587,19 @@ export const Actions = {
                 typeof parsed.blob_key === "string" ? parsed.blob_key : null;
               if (file || blobKey) {
                 const first = data.images.length === 0;
-                data.images = [
-                  ...data.images.map((img) => ({
-                    ...img,
-                    is_primary: first ? false : img.is_primary,
-                  })),
+                appendImage(
+                  data,
                   {
                     id: newId("im"),
                     file: file ?? blobKey ?? "",
                     blob_key: blobKey,
-                    is_primary: first,
                     source:
                       typeof parsed.source === "string"
                         ? parsed.source
                         : "generated",
                   },
-                ];
+                  first,
+                );
                 data.image_base = {
                   ...data.image_base,
                   type: "image",
@@ -4539,14 +4608,8 @@ export const Actions = {
                 // CR-10: a generated image may report its dominant
                 // color as theme_color in the result; it becomes the
                 // theme color (auto) unless the user set it manually.
-                if (
-                  typeof parsed.theme_color === "string" &&
-                  isValidThemeColor(parsed.theme_color) &&
-                  data.theme_color_source !== "manual"
-                ) {
-                  data.theme_color = parsed.theme_color.toLowerCase();
-                  data.theme_color_source = "auto";
-                }
+                if (typeof parsed.theme_color === "string")
+                  applyThemeColorCandidate(data, parsed.theme_color);
               }
             }
             if (req.kind === "trial_conversation") {
@@ -4607,16 +4670,6 @@ export const Actions = {
                 data.background.links.length === 0 ? "none" : "done";
             if (kindKey === "greeting" && data.greeting)
               data.preparation.greeting = "done";
-            data.preparation.status =
-              data.preparation.image === "failed" ||
-              data.preparation.link_summary === "failed" ||
-              data.preparation.greeting === "failed"
-                ? "needs_attention"
-                : data.preparation.image === "pending" ||
-                    data.preparation.link_summary === "pending" ||
-                    data.preparation.greeting === "pending"
-                  ? "preparing"
-                  : "ready";
           }
           await db
             .update(schema.profiles)
@@ -4779,15 +4832,7 @@ export const Actions = {
             // result returns a non-empty avatar_memory replaces the
             // stored memory (specification-derived elements removed,
             // other facts kept); no returned value keeps it untouched.
-            if (
-              memoryRepairRequested &&
-              typeof parsed.avatar_memory === "string" &&
-              parsed.avatar_memory.trim()
-            ) {
-              data.avatar_memory = parsed.avatar_memory
-                .trim()
-                .slice(0, 20000);
-            }
+            applyAvatarMemoryRepair(data, parsed, memoryRepairRequested);
             // Preparation outcome: every video unreadable and no notes
             // at all means the batch produced nothing — that is a
             // failure the user must see (with the unreadable list as
@@ -4909,16 +4954,7 @@ export const Actions = {
       // Preparation-hint cleanup (see description): profile_apply and
       // flavor_examples have no preparation item, so they end here —
       // their pending counts are derived from the rows themselves.
-      const kindKey =
-        req.kind === "image_generation"
-          ? ("image" as const)
-          : req.kind === "link_summary"
-            ? ("link_summary" as const)
-            : req.kind === "trial_conversation"
-              ? ("greeting" as const)
-              : req.kind === "video_transcript"
-                ? ("video" as const)
-                : null;
+      const kindKey = prepKeyForKind(req.kind);
       if (req.profileId && kindKey) {
         const remaining = await db
           .select({ status: schema.generationRequests.status })
@@ -4929,9 +4965,7 @@ export const Actions = {
               eq(schema.generationRequests.kind, req.kind),
             ),
           );
-        const stillOpen = remaining.some(
-          (r) => r.status === "pending" || r.status === "processing",
-        );
+        const stillOpen = remaining.some((r) => isOpenStatus(r.status));
         if (!stillOpen) {
           const prof = await db
             .select()
@@ -5146,9 +5180,14 @@ export const Actions = {
       const sorted = [...filtered].sort((a, b) =>
         a.name.localeCompare(b.name, "ja"),
       );
+      // S6 (R-4): pending counts from the batched openCountsByProfile
+      // (full form — the export does not use the light form).
+      const countsByProfile = await openCountsByProfile(ctx);
       const profiles = await Promise.all(
         sorted.map(async (r) => {
-          const profile = await toProfileOut(ctx, r);
+          const profile = await toProfileOut(ctx, r, {
+            counts: countsByProfile.get(r.id) ?? ZERO_PENDING_COUNTS,
+          });
           return {
             id: r.id,
             name: r.name,

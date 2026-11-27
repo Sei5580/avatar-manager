@@ -3483,9 +3483,6 @@ function CreateView({ navigate }: { navigate: (v: View) => void }) {
       </section>
 
       <div className="mt-4 space-y-6">
-        <ProfileFormFields form={form} setForm={setForm} showOptional={showOptional} onToggleOptional={() => setShowOptional(!showOptional)} elementsCollapsed={imageMode !== "elements"} hasImage={imageMode === "upload" || imageMode === "url"} />
-        {nameError && <p className="text-sm" style={{ color: "var(--accent)" }}>{nameError}</p>}
-
         {/* Image base - required section center */}
         <fieldset className="space-y-3 rounded-xl p-3" style={{ border: "2px solid var(--teal)", background: "var(--surface)" }}>
           <legend className="font-display px-1 text-base font-bold">画像のベース（必須セクション）</legend>
@@ -3519,11 +3516,15 @@ function CreateView({ navigate }: { navigate: (v: View) => void }) {
           )}
           {imageMode === "elements" && (
             <div className="space-y-3">
-              <p className="text-sm" style={{ color: "var(--dim)" }}>要素指定は上の「見た目の要素指定」で入力してください（通常表示になっています）。保存後にこの要素で画像生成を自動で依頼します。</p>
+              <p className="text-sm" style={{ color: "var(--dim)" }}>要素指定は下の「見た目の要素指定」で入力してください（通常表示になっています）。保存後にこの要素で画像生成を自動で依頼します。</p>
             </div>
           )}
           {imageMode === "none" && <p className="text-sm" style={{ color: "var(--dim)" }}>画像欄は「未設定」で保存し、あとから詳細画面で設定できます。この場合、画像は準備完了条件から外れます（image=none）。</p>}
         </fieldset>
+
+        <ProfileFormFields form={form} setForm={setForm} showOptional={showOptional} onToggleOptional={() => setShowOptional(!showOptional)} elementsCollapsed={imageMode !== "elements"} hasImage={imageMode === "upload" || imageMode === "url"} />
+        {nameError && <p className="text-sm" style={{ color: "var(--accent)" }}>{nameError}</p>}
+
 
         {/* Confirmation summary */}
         <section aria-label="確認" className="space-y-2 rounded-xl p-4 text-sm" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>

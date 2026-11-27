@@ -27,8 +27,7 @@ z,
 } from "@hatch/space-sdk";
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export const privileged = definePrivilegedContracts({
   findProfileImportTarget: {
@@ -36,6 +35,11 @@ export const privileged = definePrivilegedContracts({
       // The calling space's own slug (runtime-provided), excluded from
       // the scan so an app never "discovers" itself.
       self_slug: z.string().min(1).max(200),
+      // The calling space's own directory (runtime-provided ctx.spaceDir).
+      // The scan roots are derived from it — the folder it lives in
+      // holds its sibling spaces — so discovery does not depend on any
+      // fixed install path.
+      space_dir: z.string().min(1).max(2000),
       // The self-introduction action name (primary discovery method).
       handshake_action: z.string().min(1).max(100),
       // Action names a legacy receiver must ALL publish to qualify
@@ -104,10 +108,13 @@ function extractDefinedActions(source: string): Set<string> {
 
 export const privilegedHandlers = definePrivilegedHandlers(privileged, {
   async findProfileImportTarget(args) {
-    // Current spaces live under ts-spaces; legacy ones under spaces.
+    // Scan roots derived from this app's own location: the folder the
+    // calling space lives in holds its sibling spaces (current layout);
+    // the legacy layout kept spaces under a sibling "spaces" folder of
+    // the parent of that folder.
     const roots = [
-      join(homedir(), "workspace", "ts-spaces"),
-      join(homedir(), "workspace", "spaces"),
+      dirname(args.space_dir),
+      join(dirname(dirname(args.space_dir)), "spaces"),
     ];
     let legacy: { slug: string; name: string | null } | null = null;
     for (const root of roots) {
