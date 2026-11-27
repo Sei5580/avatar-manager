@@ -3383,6 +3383,27 @@ function CreateView({ navigate }: { navigate: (v: View) => void }) {
           note: "新規作成時の挨拶文（greeting）として短い自己紹介・挨拶を生成してください。結果は {greeting: string} で返してください。口調の構造化欄のうち手動指定（speech_sources が manual）の欄は変更せず、未設定・自動の欄は背景から推定して result の speech に含めて返してください。user_relationship（私の扱い）が指定されている場合は、その関係性に倣った接し方で挨拶文を作ってください。フレーバー項目を推定できる場合は result の flavor_traits に含めて返してください（手動指定の項目は変更しないでください）。各フレーバー項目は effective_frequency（実効頻度）に従ってください（0の項目は出さない）。",
         }),
       });
+      // R-4 (CR-24): createProfile only stores the sync preference —
+      // the chara_chat_sync request is queued HERE, after every other
+      // follow-up step (image registration and the image_generation /
+      // link_summary / trial_conversation requests) has completed, so
+      // the reflection carries the finished profile. A failure of this
+      // call does not fail the creation; the sync simply stays
+      // unqueued (charaSyncQueued stays false).
+      let charaSyncQueued = false;
+      if (syncChecked) {
+        try {
+          await api.createGenerationRequest({
+            profile_id: id,
+            kind: "chara_chat_sync",
+            payload: "{}",
+          });
+          charaSyncQueued = true;
+        } catch {
+          charaSyncQueued = false;
+        }
+      }
+      void charaSyncQueued;
       if (switchAfter) {
         await api.requestSwitch({ profile_id: id });
       }
@@ -3671,12 +3692,30 @@ function DetailView({
           favorite: form.favorite,
           sync_to_chara_chat: syncChecked,
         });
+        // R-4: createProfile defers the chara_chat_sync queueing to
+        // the caller (it returns null now) — queue it here so a
+        // duplicate made with the sync checkbox on is still reflected,
+        // exactly as before. A failure leaves charaSyncQueued false
+        // and does not fail the duplication.
+        let charaSyncQueued = false;
+        if (syncChecked) {
+          try {
+            await api.createGenerationRequest({
+              profile_id: created.id,
+              kind: "chara_chat_sync",
+              payload: "{}",
+            });
+            charaSyncQueued = true;
+          } catch {
+            charaSyncQueued = false;
+          }
+        }
         return {
           duplicatedTo: created.id,
           linkRequeued: false,
           flavorExamplesQueued: false,
           videoQueued: false,
-          charaSyncQueued: !!created.chara_chat_sync_request_id,
+          charaSyncQueued,
           applyKind: null as "profile_apply" | "switch" | null,
           applyPhrase: null as string | null,
         };

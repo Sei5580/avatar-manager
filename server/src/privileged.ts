@@ -92,6 +92,39 @@ export const privileged = definePrivilegedContracts({
   },
 });
 
+// R-13: makeThumbnail fetches user-supplied image URLs from the host,
+// so it must never reach the host itself or the internal network.
+// Block localhost hostnames and IP literals in the loopback / private /
+// link-local ranges (checked on the literal host only — no DNS
+// resolution happens here).
+function isBlockedFetchHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  // IPv4 literal: a.b.c.d
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    if (a === 10) return true; // 10.0.0.0/8
+    if (a === 127) return true; // 127.0.0.0/8 (loopback)
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    if (a === 169 && b === 254) return true; // 169.254.0.0/16 (link-local)
+    if (a === 0) return true; // 0.0.0.0/8
+    return false;
+  }
+  // IPv6 literal (URL.hostname strips the brackets).
+  if (host.includes(":")) {
+    if (host === "::1") return true; // loopback
+    const first = parseInt(host.split(":")[0] || "0", 16);
+    if (Number.isNaN(first)) return false;
+    if (first >= 0xfe80 && first <= 0xfebf) return true; // fe80::/10
+    if (first >= 0xfc00 && first <= 0xfdff) return true; // fc00::/7
+    return false;
+  }
+  return false;
+}
+
 // Action names a space's server entry defines, extracted from its
 // `name: defineAction(...)` entries. Presence in the source is the
 // functional signature the discovery matches on.
@@ -218,11 +251,20 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
         }
         if (u.protocol !== "http:" && u.protocol !== "https:")
           return fail("unsupported protocol");
+        // R-13: never fetch localhost / internal addresses from the
+        // host (SSRF guard — see isBlockedFetchHost).
+        if (isBlockedFetchHost(u.hostname))
+          return fail("blocked host");
         const resp = await fetch(u, {
           signal: AbortSignal.timeout(15000),
           redirect: "follow",
         });
         if (!resp.ok) return fail(`fetch failed: ${resp.status}`);
+        // R-13: a declared Content-Length above the cap fails BEFORE
+        // the body is read into memory.
+        const declaredLength = Number(resp.headers.get("content-length"));
+        if (Number.isFinite(declaredLength) && declaredLength > MAX_BYTES)
+          return fail("source too large");
         const ct = resp.headers.get("content-type") ?? "";
         if (ct && !ct.startsWith("image/")) return fail("not an image");
         const buf = new Uint8Array(await resp.arrayBuffer());
