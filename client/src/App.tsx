@@ -2671,6 +2671,144 @@ function FocusView({
   );
 }
 
+// CR-26: グリッド表示 — profiles in a 5-column grid (横5×縦n). Each
+// tile shows the thumbnail and the name, so many profiles can be
+// scanned at a glance. Tapping the thumbnail/name area opens that
+// profile's detail/edit screen, same as the list and focus cards.
+// The thumbnail follows the same whole-image rule as the other views
+// (object-contain over a blurred copy of itself; a monogram
+// placeholder occupies the identical square frame when no image is
+// set).
+// CR-27: each tile also carries a compact 切替 button under the name,
+// wired to the same requestSwitch flow as the list/focus cards (the
+// canned phrase surfaces in the shared PhraseBox above the grid).
+// The active profile shows a 使用中 label instead of the button, and
+// a profile with an open switch request shows 切替待ち (disabled).
+function GridTile({
+  profile,
+  onOpen,
+  onPhrase,
+}: {
+  profile: Profile;
+  onOpen: () => void;
+  onPhrase: (phrase: string) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [error, setError] = useState("");
+  const switchMut = useMutation({
+    mutationFn: async () => await api.requestSwitch({ profile_id: profile.id }),
+    onSuccess: (r) => {
+      onPhrase(r.phrase);
+      void queryClient.invalidateQueries({ queryKey: ["profiles"] });
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : "切替リクエストに失敗しました。"),
+  });
+  const src = primaryThumbSrc(profile);
+  const color = profile.theme_color || DEFAULT_THEME_COLOR;
+  const switchPending = profile.pending_switch_count > 0;
+  return (
+    <div
+      className="flex min-w-0 flex-col overflow-hidden rounded-xl"
+      style={{
+        background: `color-mix(in srgb, ${color} 6%, var(--surface))`,
+        border: `1.5px solid ${color}`,
+      }}
+    >
+      <button
+        type="button"
+        aria-label={`${profile.name}の詳細・編集を開く`}
+        title={profile.name}
+        className="block w-full text-left transition hover:opacity-90 active:scale-[0.98]"
+        onClick={onOpen}
+      >
+        <span className="relative block aspect-square w-full overflow-hidden" style={{ background: `color-mix(in srgb, ${color} 12%, var(--surface-alt))` }}>
+          {src ? (
+            <>
+              <img
+                src={src}
+                alt=""
+                aria-hidden="true"
+                loading="lazy"
+                decoding="async"
+                className="absolute inset-0 h-full w-full scale-110 object-cover opacity-40 blur-lg"
+              />
+              <img
+                src={src}
+                alt={`${profile.name}のサムネイル`}
+                loading="lazy"
+                decoding="async"
+                className="relative h-full w-full object-contain"
+              />
+            </>
+          ) : (
+            <span
+              aria-label={`${profile.name}の画像は未設定`}
+              className="font-display flex h-full w-full items-center justify-center"
+              style={{ color: "var(--accent)", fontSize: 28, lineHeight: 1.1 }}
+            >
+              {profile.name.slice(0, 1) || "?"}
+            </span>
+          )}
+        </span>
+        <span className="block w-full truncate px-1 py-1.5 text-center text-[11px] leading-4 font-semibold sm:px-1.5 sm:text-sm sm:leading-5">
+          {profile.name}
+        </span>
+      </button>
+      <div className="mt-auto px-1 pb-1.5 sm:px-1.5">
+        {profile.is_active ? (
+          <span
+            className="flex items-center justify-center rounded-md px-1 py-1 text-[11px] font-bold whitespace-nowrap text-white sm:text-xs"
+            style={{ background: "var(--teal)" }}
+          >
+            ● 使用中
+          </span>
+        ) : (
+          <button
+            type="button"
+            aria-label={`${profile.name}に切り替える`}
+            className="w-full rounded-md px-1 py-1 text-[11px] font-bold whitespace-nowrap text-white disabled:opacity-60 sm:text-xs"
+            style={{ background: "var(--accent)" }}
+            disabled={switchMut.isPending || switchPending}
+            onClick={() => switchMut.mutate()}
+          >
+            {switchMut.isPending ? "作成中…" : switchPending ? "切替待ち" : "切替"}
+          </button>
+        )}
+        {error && (
+          <p className="mt-1 text-center text-[10px] leading-3" style={{ color: "var(--accent)" }}>
+            {error}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function GridView({
+  profiles,
+  onOpen,
+  onPhrase,
+}: {
+  profiles: Profile[];
+  onOpen: (id: string) => void;
+  onPhrase: (phrase: string) => void;
+}) {
+  return (
+    <section aria-label="グリッド表示" className="mt-4">
+      <div className="grid grid-cols-5 gap-2 sm:gap-3">
+        {profiles.map((p) => (
+          <GridTile
+            key={p.id}
+            profile={p}
+            onOpen={() => onOpen(p.id)}
+            onPhrase={onPhrase}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function ListView({ navigate }: { navigate: (v: View) => void }) {
   const queryClient = useQueryClient();
   const [sort, setSort] = useState<"last_used" | "name" | "created">("last_used");
@@ -2679,9 +2817,10 @@ function ListView({ navigate }: { navigate: (v: View) => void }) {
   const [importError, setImportError] = useState("");
   const importRef = useRef<HTMLInputElement>(null);
   // CR-09: display mode. Default is the classic list; focus mode shows one
-  // profile large with prev/next arrows. Both modes share the same
-  // search/sort state, and focusId survives mode switches.
-  const [mode, setMode] = useState<"list" | "focus">("list");
+  // profile large with prev/next arrows. CR-26 adds grid mode (5-column
+  // tiles, thumbnail + name only). All modes share the same search/sort
+  // state, and focusId survives mode switches.
+  const [mode, setMode] = useState<"list" | "focus" | "grid">("list");
   const [focusId, setFocusId] = useState<string | null>(null);
   // CR-11: travel direction of the last focus move, driving the
   // slide+fade animation direction in the focus carousel.
@@ -2879,6 +3018,20 @@ function ListView({ navigate }: { navigate: (v: View) => void }) {
         >
           フォーカス表示
         </button>
+        <button
+          type="button"
+          aria-label="グリッド表示"
+          aria-pressed={mode === "grid"}
+          className="px-4 py-2 text-sm font-bold"
+          style={
+            mode === "grid"
+              ? { background: "var(--accent)", color: "var(--accent-ink)" }
+              : { background: "var(--surface)", color: "var(--dim)" }
+          }
+          onClick={() => setMode("grid")}
+        >
+          グリッド表示
+        </button>
       </div>
 
       <div className="mt-2 flex flex-wrap gap-2">
@@ -2968,6 +3121,19 @@ function ListView({ navigate }: { navigate: (v: View) => void }) {
             setFocusId(id);
           }}
           onOpen={() => navigate({ kind: "detail", id: focusProfile.id })}
+          onPhrase={(ph) => setPhrase(ph)}
+        />
+      )}
+
+      {mode === "grid" && list.data && profiles.length === 0 && (
+        <p className="mt-6 text-sm" style={{ color: "var(--dim)" }}>
+          該当するプロファイルがありません。検索条件を変えるか、一覧表示で確認してください。
+        </p>
+      )}
+      {mode === "grid" && profiles.length > 0 && (
+        <GridView
+          profiles={profiles}
+          onOpen={(id) => navigate({ kind: "detail", id })}
           onPhrase={(ph) => setPhrase(ph)}
         />
       )}
@@ -3566,6 +3732,7 @@ function CreateView({ navigate }: { navigate: (v: View) => void }) {
           <button type="button" aria-label="保存する" className="rounded-lg px-5 py-2.5 text-sm font-bold text-white" style={{ background: "var(--accent)" }} disabled={saving} onClick={() => void save(false)}>{saving ? "保存中…" : "保存する（必須だけでも可）"}</button>
           <button type="button" aria-label="保存してすぐ切り替える" className="rounded-lg px-4 py-2 text-sm font-bold" style={{ border: "2px solid var(--accent)", color: "var(--accent)" }} disabled={saving} onClick={() => void save(true)}>保存してすぐ切り替える</button>
         </div>
+        <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>保存すると、背景リンクの要約・参考動画の文字起こし・挨拶文の生成リクエストが自動で登録されます。実際の読み取りや生成はチャット側の処理です。リクエスト一覧に表示される案内文をチャットに貼ると処理が始まります（キャラチャットへの同期だけは自動で処理されます）。</p>
       </div>
     </div>
   );
@@ -3590,6 +3757,7 @@ function DetailView({
   const profile = detail.data?.profile;
   const [form, setForm] = useState<FormState | null>(null);
   const [saveMsg, setSaveMsg] = useState("");
+  const [greetingMsg, setGreetingMsg] = useState("");
   const [saveError, setSaveError] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
   // CR-04: phrase created by the action just taken (switch or apply).
@@ -3881,6 +4049,30 @@ function DetailView({
       setSaveError(e instanceof Error ? e.message : "リクエストの作成に失敗しました。"),
   });
 
+  // Greeting re-creation: same trial_conversation flow as at creation
+  // time, with the note reworded for a re-creation. On success the
+  // request joins the normal generation-request queue (the greeting
+  // turns pending server-side and is replaced when the chat side
+  // completes the request).
+  const greetingRegenMut = useMutation({
+    mutationFn: async (payload: string) =>
+      await api.createGenerationRequest({
+        profile_id: id,
+        kind: "trial_conversation",
+        payload,
+      }),
+    onSuccess: () => {
+      setGreetingMsg(
+        "挨拶文の再作成リクエストを作成しました。チャット側で処理されると、挨拶文が新しいものに置き換わります。",
+      );
+      invalidateAll();
+    },
+    onError: (e) =>
+      setSaveError(
+        e instanceof Error ? e.message : "挨拶文の再作成リクエストの作成に失敗しました。",
+      ),
+  });
+
   // A-09 alternative: give up on the image and use the profile without one.
   const imageNoneMut = useMutation({
     mutationFn: async () => {
@@ -3979,7 +4171,14 @@ function DetailView({
   const removeImgMut = useMutation({
     mutationFn: async (imageId: string) =>
       await api.removeImage({ profile_id: id, image_id: imageId }),
-    onSuccess: () => invalidateAll(),
+    // CR-28: reset the edit form like the other image mutations do —
+    // the form carries image_base.image_ref as load-time state, so
+    // keeping the pre-deletion form would re-submit the deleted image's
+    // reference on the next save.
+    onSuccess: () => {
+      setForm(null);
+      invalidateAll();
+    },
   });
 
   const restoreMut = useMutation({
@@ -4019,6 +4218,14 @@ function DetailView({
   const trialResults = (genList.data?.requests ?? []).filter(
     (r) => r.kind === "trial_conversation",
   );
+  // An unfinished trial_conversation (or a greeting still marked
+  // pending) means a (re-)creation is already queued — block duplicates
+  // in the UI as well (the server upserts too).
+  const greetingRequestOpen =
+    profile.preparation.greeting === "pending" ||
+    trialResults.some(
+      (r) => r.status === "pending" || r.status === "processing",
+    );
   const inputCls = "w-full rounded-lg px-3 py-2 text-sm";
   const inputStyle = { background: "var(--surface)", border: "1px solid var(--border)" };
 
@@ -4119,6 +4326,55 @@ function DetailView({
             ) : (
               <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>未設定</p>
             )}
+            <div className="mt-2">
+              <button
+                type="button"
+                aria-label="挨拶文を再作成する"
+                className="rounded-lg px-3 py-2 text-sm font-semibold"
+                style={{ border: "1px solid var(--border)" }}
+                disabled={greetingRequestOpen || greetingRegenMut.isPending}
+                onClick={() => {
+                  setGreetingMsg("");
+                  greetingRegenMut.mutate(
+                    JSON.stringify({
+                      name: profile.name,
+                      speech_style: profile.speech.style,
+                      tuning: profile.speech.tuning,
+                      call_user_as: profile.call_user_as,
+                      speech_structured: {
+                        first_person: profile.speech.structured.first_person,
+                        second_person: profile.speech.structured.second_person,
+                        call_user_as: profile.call_user_as,
+                        catchphrase: profile.speech.structured.catchphrase,
+                        memo: profile.speech.structured.memo,
+                      },
+                      speech_sources: profile.speech.sources,
+                      background: profile.background.text,
+                      user_relationship: profile.background.user_relationship ?? null,
+                      flavor_level: profile.flavor?.level ?? 3,
+                      flavor_traits: (profile.flavor?.traits ?? []).map((t) => ({
+                        ...t,
+                        frequency: t.frequency ?? null,
+                        effective_frequency: effectiveFlavorFrequency(t, profile.flavor?.level ?? 3),
+                      })),
+                      links: profile.background.links,
+                      note: "挨拶文（greeting）を再作成してください。短い自己紹介・挨拶を生成し、結果は {greeting: string} で返してください。口調の構造化欄のうち手動指定（speech_sources が manual）の欄は変更せず、未設定・自動の欄は背景から推定して result の speech に含めて返してください。user_relationship（私の扱い）が指定されている場合は、その関係性に倣った接し方で挨拶文を作ってください。フレーバー項目を推定できる場合は result の flavor_traits に含めて返してください（手動指定の項目は変更しないでください）。各フレーバー項目は effective_frequency（実効頻度）に従ってください（0の項目は出さない）。",
+                    }),
+                  );
+                }}
+              >
+                {greetingRegenMut.isPending
+                  ? "作成中…"
+                  : greetingRequestOpen
+                    ? "再作成リクエスト済み（処理待ち）"
+                    : "挨拶文を再作成"}
+              </button>
+              {greetingMsg && (
+                <p className="mt-2 rounded-lg p-3 text-sm" style={{ background: "var(--surface-alt)" }} role="status">
+                  {greetingMsg}
+                </p>
+              )}
+            </div>
             <p className="mt-3 text-sm font-semibold">準備ステータス</p>
             <PreparationChecklist profile={profile} />
             <p className="mt-3 text-sm font-semibold">私の扱い</p>
@@ -4431,6 +4687,7 @@ function DetailView({
             </button>
           ))}
       </div>
+      <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>保存すると、背景リンクの要約・参考動画の文字起こし・挨拶文の生成リクエストが自動で登録されます。実際の読み取りや生成はチャット側の処理です。リクエスト一覧に表示される案内文をチャットに貼ると処理が始まります（キャラチャットへの同期だけは自動で処理されます）。</p>
 
       {/* Images */}
       <section aria-label="アバター画像" className="mt-6">
