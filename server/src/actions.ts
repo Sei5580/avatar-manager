@@ -437,6 +437,32 @@ const profileDataSchema = z.object({
   // completed (ISO string), written ONLY by that kind's write-back.
   // Null = never reflected yet.
   chara_chat_synced_at: z.string().max(100).nullable().default(null),
+  // F-3 (TC-N05): monotonic revision of avatar_memory. It advances
+  // ONLY when a generation write-back changes avatar_memory (the
+  // CR-21 addendum-2 repair path — the one write-back that may
+  // replace the memory). The edit form sends the revision it loaded
+  // with its save; when that revision is older than the stored one
+  // and the submitted memory differs from the stored one, the server
+  // keeps the stored memory (the form was opened before the repair
+  // landed and must not roll it back). Legacy profiles parse with 0.
+  avatar_memory_revision: z.number().int().min(0).default(0),
+  // F-6 (TC-12/14/15a): deletion records (tombstones) for auto
+  // content the user removed in an edit save — auto catchphrase
+  // items, auto flavor trait labels, and per-trait generated example
+  // lines. Generation write-back merges consult these records so
+  // deleted content is not resurrected by a later union merge; a
+  // record is released when the user manually re-enters the same
+  // content. Stored inside the profile JSON (no DB schema change).
+  // Legacy profiles parse with empty records.
+  deletion_records: z
+    .object({
+      catchphrases: z.array(z.string().max(1000)).max(50).default([]),
+      flavor_labels: z.array(z.string().max(200)).max(50).default([]),
+      flavor_examples: z
+        .record(z.string(), z.array(z.string().max(1000)).max(10))
+        .default({}),
+    })
+    .default({ catchphrases: [], flavor_labels: [], flavor_examples: {} }),
 });
 
 type ProfileData = z.infer<typeof profileDataSchema>;
@@ -905,7 +931,15 @@ function applyAvatarMemoryRepair(
     typeof parsed.avatar_memory === "string" &&
     parsed.avatar_memory.trim()
   ) {
-    data.avatar_memory = parsed.avatar_memory.trim().slice(0, 20000);
+    const next = parsed.avatar_memory.trim().slice(0, 20000);
+    // F-3: a generation write-back that actually CHANGES
+    // avatar_memory advances its revision, so an edit form opened
+    // before the repair can be recognized as stale at save time and
+    // cannot roll the repaired memory back (TC-N05).
+    if (next !== data.avatar_memory) {
+      data.avatar_memory = next;
+      data.avatar_memory_revision = (data.avatar_memory_revision ?? 0) + 1;
+    }
   }
 }
 
@@ -1135,6 +1169,28 @@ const SPEECH_MERGE_NOTE =
 const FLAVOR_MERGE_NOTE =
   "フレーバーの書き戻しはマージ規則（CR-20）で反映されます：書き戻しに含まれる自動項目は、ラベルが一致する既存の自動項目を土台に更新されます（例文は既存を保持しつつ新しいものを足します。場面・有効/無効・頻度は既存の値を優先し、書き戻し側の値で上書きしません）。ラベルが新しい項目は自動項目として追加されます。書き戻しに含まれなかった既存の自動項目は削除されず、そのまま残ります。manual_flavor_traits に挙がった項目（ユーザーの手動指定）は書き戻しで変更・削除しないでください。フレーバーの量（level）はユーザーのバー設定なので変更しないでください。";
 
+// CR-29: two-stage fetch — the STANDARD way every profile's reference
+// material is read (all profiles, no exceptions). Stage 1 is the
+// existing lightweight text fetch; anything it cannot read moves to
+// Stage 2, a real browser, instead of being given up as unreadable.
+// Field incident (ゼロ): most of the profile's background links lived
+// on one domain the text-fetch route could not reach at all (no HTTP
+// response — DNS/connection level), so the summary and tone were built
+// from the single remaining link even though the same pages opened
+// fine in a real browser. The artifact itself never fetches URLs —
+// the chat-side agent does — so the standard lives in the payload of
+// every request that reads URLs: link_summary payloads carry it as
+// link_fetch_note / fetch_fallback_note (and inside `note`), trial
+// payloads that carry links carry it too, and video_transcript
+// payloads carry the transcript variant. A URL may be recorded as
+// unreadable ONLY after BOTH stages failed, and the recorded reason
+// must say what happened in each stage so a later reader can tell a
+// dead site from a fetch-route failure.
+const LINK_FETCH_FALLBACK_NOTE =
+  "参考リンクの取得は二段階で行ってください（全プロファイル共通の標準手順です）。第一段階：通常のテキスト取得（テキスト取得経路）で各URLの本文を取得してください。第二段階：第一段階で取得できなかったURL（ネットワークエラー／DNS・接続失敗で応答自体が返らない／HTTPエラー／本文が空または極端に短い／JavaScript必須で本文が取れない等）は、読み取り不可と判断せず、実ブラウザを起動してそのURLを開き、表示された本文を取得してください。unreadable_links に入れてよいのは、第一段階と第二段階の両方で取得できなかったURLだけです。その場合、理由には両段階の失敗内容を分かる範囲で含めてください（例: 「URL（第一段階: 接続失敗／第二段階: ブラウザでも表示不可）」）。第一段階の失敗だけで unreadable_links に入れないでください。";
+const VIDEO_FETCH_FALLBACK_NOTE =
+  "参考動画の文字起こし取得も二段階で行ってください（全プロファイル共通の標準手順です）。第一段階：通常の方法（字幕／トランスクリプト取得経路）で各動画の文字起こしを取得してください。第二段階：第一段階で取得できなかった動画は、取得不可と判断せず、実ブラウザを起動してその動画ページを開き、字幕・文字起こしを取得してください（ページ内で取得できる字幕データや表示されるトランスクリプトを含みます）。unreadable_videos に入れてよいのは、第一段階と第二段階の両方で取得できなかった動画だけです。その場合、理由には両段階の失敗内容を分かる範囲で含めてください。第一段階の失敗だけで unreadable_videos に入れないでください。";
+
 // CR-22: standing note on how to address the user (呼びかけ・二人称),
 // carried as `address_note` in the ACTING payloads only — switch
 // request output, profile_apply payloads, and trial_conversation
@@ -1150,22 +1206,46 @@ const FLAVOR_MERGE_NOTE =
 const ADDRESS_NOTE =
   "呼びかけ・二人称の使い方：呼びかけには call_user_as（設定があれば）を使い、文の自然な位置に置くこと。二人称代名詞（あなた／お前／貴様など）は文中の主語・目的語として必要なときにだけ使い、文末に『〜だ、あなた』『〜だ、お前』のように付けないこと。日本語では呼びかけや二人称は省略されるのが普通なので、迷ったら付けないこと";
 
+// F-10 (TC-N10): standing note carried in every payload that hands
+// tone material to the chat side (trial_conversation, flavor_examples,
+// link_summary, video_transcript): when the free-text tone memo and
+// the structured speech fields disagree, the structured fields win.
+// It changes no stored data — it only disambiguates the material at
+// the point of use.
+const STRUCTURED_PRIORITY_NOTE =
+  "構造化された口調欄（一人称・二人称・呼び方・決め台詞）と口調メモの自由文が食い違う場合は、構造化欄を優先すること";
+
 // CR-20 / CR-18: apply auto speech updates with the unified merge
 // rules, on top of the CR-06 manual protection (applyAutoSpeechFields
 // still guarantees manual fields are never overwritten):
 // - catchphrase: UNION merge — stored items are kept and new
-//   candidates (the update's catchphrase string split on "／", plus
-//   any extra candidates such as a video result's catchphrases[] list)
-//   are appended after them, deduplicated by exact match, joined with
-//   "／" within the 1000-char schema limit (whole trailing items are
-//   dropped rather than cutting one mid-phrase). The stored value is
-//   never replaced wholesale.
+//   candidates (the update's catchphrase string split into items,
+//   plus any extra candidates such as a video result's catchphrases[]
+//   list) are appended after them, deduplicated by exact match,
+//   joined with "／" within the 1000-char schema limit (whole trailing
+//   items are dropped rather than cutting one mid-phrase). The stored
+//   value is never replaced wholesale. Splitting accepts BOTH the
+//   canonical "／" separator and newlines (TC-12 retest note): a
+//   write-back that returns its catchphrases newline-separated must
+//   still be matched item-by-item against the F-6 deletion records —
+//   treated as one blob it would slip past them and resurrect a
+//   deleted item. The stored form is always re-joined with "／".
 // - first_person / second_person: single values, never merged — an
 //   update is dropped when the field already holds a value (auto or
 //   manual); filled only when unset.
 // - memo / style / call_user_as: applied as returned — for memo/style
 //   the contract (stated in every payload note) is that the returned
 //   text is already integrated on top of the existing tone.
+// Split a catchphrase value into its items. Both the canonical "／"
+// separator and newlines count as separators (see the merge rules
+// above); items are trimmed and empties dropped.
+function splitCatchphraseItems(value: string | null | undefined): string[] {
+  return (value ?? "")
+    .split(/[／\r\n]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 function applyMergedAutoSpeechFields(
   data: ProfileData,
   updates: Partial<Record<SpeechFieldKey, string>>,
@@ -1174,22 +1254,24 @@ function applyMergedAutoSpeechFields(
   const merged: Partial<Record<SpeechFieldKey, string>> = { ...updates };
   const candidates: string[] = [];
   for (const c of extraCatchphraseCandidates) {
-    if (c && c.trim()) candidates.push(c.trim());
+    candidates.push(...splitCatchphraseItems(c));
   }
   if (merged.catchphrase) {
-    for (const part of merged.catchphrase.split("／")) {
-      if (part.trim()) candidates.push(part.trim());
-    }
+    candidates.push(...splitCatchphraseItems(merged.catchphrase));
     delete merged.catchphrase;
   }
   if (candidates.length > 0) {
-    const existing = (data.speech.structured.catchphrase ?? "")
-      .split("／")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const existing = splitCatchphraseItems(
+      data.speech.structured.catchphrase,
+    );
+    // F-6: a catchphrase item the user deleted (deletion record) is
+    // never re-added by a union merge — the deletion stands until the
+    // user manually types the same item again (which releases the
+    // record in updateProfile).
+    const tombstoned = new Set(data.deletion_records?.catchphrases ?? []);
     const items = [...existing];
     for (const c of candidates) {
-      if (!items.includes(c)) items.push(c);
+      if (!items.includes(c) && !tombstoned.has(c)) items.push(c);
     }
     let joined = "";
     for (const item of items) {
@@ -1239,24 +1321,36 @@ function applyAutoFlavorTraits(
     examples: [...t.examples],
     scenes: [...t.scenes],
   }));
+  // F-6: deletion records — a trait whose label the user deleted is
+  // never resurrected by a write-back, and example lines the user
+  // deleted for a trait are never re-added by the union merge. The
+  // records are released only when the user manually re-enters the
+  // same label / line (see updateProfile).
+  const tombstonedLabels = new Set(data.deletion_records?.flavor_labels ?? []);
+  const tombstonedExamples = data.deletion_records?.flavor_examples ?? {};
   let added = 0;
   for (const inc of incoming) {
     if (manualLabels.has(inc.label)) continue;
     const idx = traits.findIndex(
       (t) => t.source === "auto" && t.label === inc.label,
     );
+    const deadExamples = new Set(tombstonedExamples[inc.label] ?? []);
     if (idx >= 0) {
       const existing = traits[idx] as FlavorTrait;
       const examples = [...existing.examples];
       for (const ex of inc.examples) {
-        if (!examples.includes(ex)) examples.push(ex);
+        if (!examples.includes(ex) && !deadExamples.has(ex))
+          examples.push(ex);
       }
       traits[idx] = { ...existing, examples: examples.slice(0, 10) };
     } else {
+      // F-6: a deleted label stays deleted — the write-back trait is
+      // dropped instead of being re-added as a new auto trait.
+      if (tombstonedLabels.has(inc.label)) continue;
       traits.push({
         id: `ft_auto_${Date.now().toString(36)}_${added++}_${Math.random().toString(36).slice(2, 7)}`,
         label: inc.label,
-        examples: [...inc.examples],
+        examples: inc.examples.filter((ex) => !deadExamples.has(ex)),
         scenes: [...inc.scenes],
         enabled: inc.enabled,
         source: "auto" as const,
@@ -1379,6 +1473,89 @@ async function blobKeyReferencedByOtherProfile(
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// F-12: trash expiry — permanent deletion shared by purgeProfile and
+// the automatic 30-day sweep.
+// ---------------------------------------------------------------------------
+
+const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Permanently deletes one trashed profile row with exactly the steps
+// of the manual 完全削除 (purgeProfile): its history, its generation /
+// switch request rows, the profile row itself, and its image blobs —
+// except any blob another profile still references (R-9: duplicated
+// profiles share blobs). Thumbnails under thumbs/ are content-
+// addressed and shared, so they are never deleted here.
+async function purgeTrashedProfileRow(
+  ctx: Ctx,
+  row: ProfileRow,
+): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  // R-9: decide which of this profile's image blobs may go BEFORE
+  // the row disappears — a blob another profile still references
+  // (e.g. the original of a duplicate) must survive the purge.
+  const data = parseData(row.data);
+  const blobKeys = [
+    ...new Set(
+      data.images.map((i) => i.blob_key).filter((k): k is string => !!k),
+    ),
+  ];
+  const deletableKeys: string[] = [];
+  for (const key of blobKeys) {
+    if (!(await blobKeyReferencedByOtherProfile(ctx, key, row.id)))
+      deletableKeys.push(key);
+  }
+  await db
+    .delete(schema.profileHistory)
+    .where(eq(schema.profileHistory.profileId, row.id));
+  // R-7: the profile's queued request rows go with it — leaving
+  // them behind kept deleted profiles' requests in the database
+  // forever.
+  await db
+    .delete(schema.generationRequests)
+    .where(eq(schema.generationRequests.profileId, row.id));
+  await db
+    .delete(schema.switchRequests)
+    .where(eq(schema.switchRequests.profileId, row.id));
+  await db.delete(schema.profiles).where(eq(schema.profiles.id, row.id));
+  for (const key of deletableKeys) {
+    try {
+      await ctx.blobs.delete(key);
+    } catch {
+      // Blob cleanup is best-effort.
+    }
+  }
+}
+
+// F-12: the automatic expiry sweep. The trash promises restoration
+// for 30 days, but until now nothing ever removed a row after that —
+// trashed copies stayed forever unless the user purged each one by
+// hand. Profiles whose deleted_at is more than 30 days ago are now
+// permanently deleted with the same procedure as a manual purge
+// (history and request rows go with them; blobs still referenced by
+// another profile survive). There is no scheduler in this app, so
+// the sweep runs lazily at the head of the main read paths
+// (listProfiles / listTrash / getSummary) — every screen that could
+// show a stale trashed copy reads through one of them. Best-effort
+// per profile: one failure never blocks the read or the other
+// expiries, and the expired row is simply retried on the next read.
+async function purgeExpiredTrash(ctx: Ctx): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  const cutoff = Date.now() - TRASH_RETENTION_MS;
+  const rows = await db.select().from(schema.profiles);
+  const expired = rows.filter(
+    (r) => r.deletedAt != null && r.deletedAt.getTime() <= cutoff,
+  );
+  for (const row of expired) {
+    try {
+      await purgeTrashedProfileRow(ctx, row);
+    } catch {
+      // Best-effort: retried on the next read.
+    }
+  }
+  if (expired.length > 0) ctx.invalidateQueries();
+}
+
 // The preparation item a generation request kind drives (null for the
 // kinds that have no preparation item: profile_apply, flavor_examples,
 // chara_chat_sync).
@@ -1406,11 +1583,18 @@ function prepKeyForKind(
 // Traits that still need auto-generated examples: auto_examples is on
 // and no non-empty example is stored yet.
 function flavorExamplesTargets(data: ProfileData): FlavorTrait[] {
+  // F-6: a trait whose generated examples the user deleted down to
+  // empty (a deletion record exists for its label) is NOT re-queued —
+  // the empty state is the user's decision, not a gap to refill. The
+  // record is released when the user manually adds an example again,
+  // which also makes the trait ineligible here by having examples.
+  const tombstonedExamples = data.deletion_records?.flavor_examples ?? {};
   return (data.flavor ?? emptyFlavor).traits.filter(
     (t) =>
       t.auto_examples &&
       t.label.trim() &&
-      !t.examples.some((e) => e.trim()),
+      !t.examples.some((e) => e.trim()) &&
+      !(tombstonedExamples[t.label]?.length),
   );
 }
 
@@ -1437,6 +1621,8 @@ function buildFlavorExamplesPayload(
     speech_style: data.speech.style,
     speech: mergedSpeechView(data),
     speech_structured: speechStructuredPayload(data),
+    // F-10: structured speech fields win over the free-text memo.
+    structured_priority_note: STRUCTURED_PRIORITY_NOTE,
     call_user_as: data.call_user_as,
     summary: data.summary,
     background_summary: data.background.link_summary,
@@ -1626,6 +1812,8 @@ function buildVideoTranscriptPayload(
     ...portrayalFields(data, portrayalVideoNote),
     speech: mergedSpeechView(data),
     speech_structured: speechStructuredPayload(data),
+    // F-10: structured speech fields win over the free-text memo.
+    structured_priority_note: STRUCTURED_PRIORITY_NOTE,
     speech_sources: { ...data.speech.sources },
     manual_speech_fields: manualSpeechFields(data),
     existing_video_notes: data.background.video_notes ?? null,
@@ -1638,7 +1826,11 @@ function buildVideoTranscriptPayload(
     flavor_traits: flavorTraitsPayload(data),
     manual_flavor_traits: manualFlavorTraitsPayload(data),
     flavor_note: FLAVOR_MERGE_NOTE,
-    note: "video_urls は参考動画です。各動画の文字起こし（字幕／トランスクリプト）だけを取得してください。動画を再生・視聴する必要はありません。文字起こしは自動音声認識のことが多く誤認識を含みます。明らかな誤りは文脈で補正し、台詞をそのままの引用としてではなく、口癖・語尾・一人称／二人称など口調の材料として読んでください。話者の区切りが字幕にない場合は場面から推定してください。書き戻し result は {\"video_notes\": \"台詞から読み取れた口調の特徴の要約\", \"catchphrases\": [\"決まり文句・口癖の候補\", ...], \"unreadable_videos\": [\"文字起こしを取得できなかったURL\", ...]} の形で返してください。あわせて推定できた口調があれば first_person / second_person / memo / style などのキー（または speech オブジェクト）で含めて構いません。台詞から推定できるフレーバー項目があれば、result の flavor_traits（または flavor.traits）に {label, examples[], scenes[], enabled} の形で含めてください（フレーバーの反映は flavor_note のマージ規則どおりです）。取得できなかった動画は理由とともに unreadable_videos に入れてください（例: \"URL（字幕なし）\"）。manual_speech_fields に挙がった口調欄はユーザーの手動指定なので変更しないでください（サーバー側でも手動欄への反映は行われません）。口調の書き戻しはマージ規則（CR-18／CR-20）で反映されます：catchphrases（口癖）はサーバー側で既存の値と和集合マージされます（既存の口癖は消えません。新しい候補だけを返してください）。first_person / second_person は未設定のときだけ反映され、既に値がある場合は動画側の推定で上書きされません。memo / style を返す場合は、この payload の speech / speech_structured に含まれる既存の口調を土台に、その内容を消さず、動画の知見を統合した文章として返してください（返した文章がそのまま自動項目に反映されます）。",
+    // CR-29: two-stage fetch is the standard for transcripts too.
+    fetch_policy: "two_stage_text_then_browser",
+    fetch_fallback_note: VIDEO_FETCH_FALLBACK_NOTE,
+    video_fetch_note: VIDEO_FETCH_FALLBACK_NOTE,
+    note: "video_urls は参考動画です。各動画の文字起こし（字幕／トランスクリプト）だけを取得してください。動画を再生・視聴する必要はありません。文字起こしは自動音声認識のことが多く誤認識を含みます。明らかな誤りは文脈で補正し、台詞をそのままの引用としてではなく、口癖・語尾・一人称／二人称など口調の材料として読んでください。話者の区切りが字幕にない場合は場面から推定してください。書き戻し result は {\"video_notes\": \"台詞から読み取れた口調の特徴の要約\", \"catchphrases\": [\"決まり文句・口癖の候補\", ...], \"unreadable_videos\": [\"文字起こしを取得できなかったURL\", ...]} の形で返してください。あわせて推定できた口調があれば first_person / second_person / memo / style などのキー（または speech オブジェクト）で含めて構いません。台詞から推定できるフレーバー項目があれば、result の flavor_traits（または flavor.traits）に {label, examples[], scenes[], enabled} の形で含めてください（フレーバーの反映は flavor_note のマージ規則どおりです）。取得できなかった動画は理由とともに unreadable_videos に入れてください（例: \"URL（字幕なし）\"）。manual_speech_fields に挙がった口調欄はユーザーの手動指定なので変更しないでください（サーバー側でも手動欄への反映は行われません）。口調の書き戻しはマージ規則（CR-18／CR-20）で反映されます：catchphrases（口癖）はサーバー側で既存の値と和集合マージされます（既存の口癖は消えません。新しい候補だけを返してください）。first_person / second_person は未設定のときだけ反映され、既に値がある場合は動画側の推定で上書きされません。memo / style を返す場合は、この payload の speech / speech_structured に含まれる既存の口調を土台に、その内容を消さず、動画の知見を統合した文章として返してください（返した文章がそのまま自動項目に反映されます）。 " + VIDEO_FETCH_FALLBACK_NOTE,
   });
 }
 
@@ -1703,6 +1895,367 @@ async function queueVideoTranscriptRequest(
     }
   }
   return requestId;
+}
+
+// ---------------------------------------------------------------------------
+// F-1 (TC-20): refresh pending trial_conversation payloads on save
+// ---------------------------------------------------------------------------
+
+// After an edit save, a trial_conversation request that is still
+// PENDING would otherwise be processed with the tone material frozen
+// at queue time — the greeting would be generated from the OLD tone
+// even though the user just corrected it. Rebuild the payload's
+// tone-material fields (structured speech, call_user_as, 「私の扱い」,
+// flavor, tuning — the tuning rides inside the merged speech view)
+// from the just-saved profile, in place: the request keeps its id and
+// its pending status, no new request is created, and a PROCESSING
+// request is left frozen (it is already being worked on). Everything
+// else in the payload — above all base_greeting (F-4), which pins the
+// greeting as it was at queue time — is preserved exactly.
+async function refreshPendingTrialPayloads(
+  ctx: Ctx,
+  profileId: string,
+  data: ProfileData,
+): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.generationRequests)
+    .where(
+      and(
+        eq(schema.generationRequests.profileId, profileId),
+        eq(schema.generationRequests.kind, "trial_conversation"),
+        eq(schema.generationRequests.status, "pending"),
+      ),
+    );
+  for (const row of rows) {
+    const obj = parsePayloadObject(row.payload);
+    // D-2: the tone-material field set is shared with the payload
+    // builders below (toneMaterialFields) — the same fields, rebuilt
+    // from the just-saved profile. Everything else in the payload —
+    // above all base_greeting (F-4) — is preserved exactly.
+    Object.assign(obj, toneMaterialFields(data));
+    obj.call_user_as = data.call_user_as;
+    // The top-level speech_style and tuning keys (caller keys) are
+    // not part of toneMaterialFields, so refresh them too —
+    // otherwise they keep the queue-time values while speech.style /
+    // speech.tuning move to the new values and the payload
+    // contradicts itself.
+    obj.speech_style = data.speech.style;
+    obj.tuning = data.speech.tuning;
+    await db
+      .update(schema.generationRequests)
+      .set({ payload: JSON.stringify(obj), updatedAt: new Date() })
+      .where(eq(schema.generationRequests.id, row.id));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// D-2: generation payload assembly, unified in one place
+// ---------------------------------------------------------------------------
+
+// The tone-material fields every link_summary / trial_conversation
+// payload carries, derived from the profile's CURRENT stored state:
+// the merged speech view and its structured form, the speech sources
+// and manual-field list, 「私の扱い」, the reference videos' tone
+// findings, the flavor setting, and the F-10 priority note. Shared by
+// buildLinkSummaryPayload / buildTrialPayload (which add their
+// kind-specific notes on top) and by refreshPendingTrialPayloads
+// (F-1), which refreshes exactly this field set in place.
+function toneMaterialFields(data: ProfileData): Record<string, unknown> {
+  return {
+    speech: mergedSpeechView(data),
+    speech_structured: speechStructuredPayload(data),
+    speech_sources: { ...data.speech.sources },
+    manual_speech_fields: manualSpeechFields(data),
+    // CR-07: 「私の扱い」 — the relationship specification the
+    // greeting / summary generation must follow when present.
+    user_relationship: data.background.user_relationship ?? null,
+    background_user_relationship: data.background.user_relationship ?? null,
+    // CR-17: tone findings from the reference videos' dialogue, as
+    // reference material for summary/greeting generation.
+    video_notes: data.background.video_notes ?? null,
+    background_video_notes: data.background.video_notes ?? null,
+    // CR-08: flavor — the merged view (level + enabled traits), the
+    // full stored trait list, and the manual traits the write-back
+    // must never change or remove.
+    flavor: mergedFlavorView(data),
+    flavor_level: (data.flavor ?? emptyFlavor).level,
+    flavor_traits: flavorTraitsPayload(data),
+    manual_flavor_traits: manualFlavorTraitsPayload(data),
+    // F-10: structured speech fields win over the free-text memo.
+    structured_priority_note: STRUCTURED_PRIORITY_NOTE,
+  };
+}
+
+const USER_RELATIONSHIP_NOTE =
+  "user_relationship は「私の扱い」（このキャラクターから見てユーザーがどういう存在か）の指定です。指定がある場合は、挨拶文や口調の生成でその関係性（主従・対等などの距離感や態度）に倣ってください。null（未指定）の場合は、背景や呼び方から自然に推定される扱いのままで構いません。この項目自体はユーザーの指定であり、書き戻しで変更しないでください。";
+const VIDEO_NOTES_NOTE =
+  "video_notes は参考動画の文字起こし（台詞）から読み取れた口調の特徴です。ある場合は、挨拶文や口調の生成でその口癖・語尾・言い回しを参考にしてください。null の場合は動画由来の材料はまだありません。";
+const SPEECH_PAYLOAD_NOTE =
+  "口調の構造化欄です。manual_speech_fields に挙がった欄はユーザーの手動指定なので書き戻しで変更しないでください。それ以外の欄は背景URLや名前から推定して、書き戻し result の speech（または first_person 等のキー）に含めてください。" +
+  SPEECH_MERGE_NOTE;
+const FLAVOR_PAYLOAD_NOTE =
+  "フレーバー項目（キャラクターらしさ）です。背景URLや名前から推定できる項目は、書き戻し result の flavor_traits（または flavor.traits）に {label, examples[], scenes[], enabled} の形で含めてください。" +
+  FLAVOR_MERGE_NOTE +
+  " CR-14: 各項目の frequency（null=全体に従う）から決まる effective_frequency がその項目の実効頻度です。実効頻度0の項目は出さないでください。";
+
+// D-2 (m-1): the trial_conversation note the guarantee function uses,
+// copied verbatim from the create form's creation-time note (App.tsx)
+// — one single wording for every server-queued trial request
+// (creation, duplication, restore, edit), regardless of the path that
+// queued it. Callers that pass their own note (re-creation, retry,
+// request buttons) keep theirs under the caller-priority rule.
+const TRIAL_CREATE_NOTE =
+  "新規作成時の挨拶文（greeting）として短い自己紹介・挨拶を生成してください。結果は {greeting: string} で返してください。口調の構造化欄のうち手動指定（speech_sources が manual）の欄は変更せず、未設定・自動の欄は背景から推定して result の speech に含めて返してください。user_relationship（私の扱い）が指定されている場合は、その関係性に倣った接し方で挨拶文を作ってください。フレーバー項目を推定できる場合は result の flavor_traits に含めて返してください（手動指定の項目は変更しないでください）。各フレーバー項目は effective_frequency（実効頻度）に従ってください（0の項目は出さない）。";
+
+// Build the link_summary payload for a profile. Value priority (D-2 /
+// M-1): the seven caller keys — links / name / speech_style / tuning /
+// call_user_as / background / note — keep the CALLER's value whenever
+// one is passed (an unsaved form value must never be overwritten by
+// the stored one); only the guarantee function fills them, from the
+// stored profile, when it queues on its own. Every other key is
+// server-owned and always (re)built here from the profile's current
+// state, exactly as createGenerationRequest / updateProfile built
+// them inline before: the tone material (CR-06/07/08/17), the speech
+// and flavor merge-rule notes (CR-20), the CR-29 two-stage fetch
+// instruction, and the CR-19 portrayal fields. opts.memoryRepair adds
+// the CR-21 addendum-2 avatar_memory repair fields (updateProfile's
+// portrayal_focus-removal re-queue).
+function buildLinkSummaryPayload(
+  data: ProfileData,
+  callerValues?: Record<string, unknown>,
+  opts?: { memoryRepair?: boolean },
+): string {
+  const obj: Record<string, unknown> = { ...(callerValues ?? {}) };
+  Object.assign(obj, toneMaterialFields(data));
+  obj.user_relationship_note = USER_RELATIONSHIP_NOTE;
+  obj.video_notes_note = VIDEO_NOTES_NOTE;
+  obj.speech_note = SPEECH_PAYLOAD_NOTE;
+  // CR-20: the merge rules are also stated under an explicit key (and
+  // as the payload note) so the chat side cannot miss them.
+  obj.speech_merge_note = SPEECH_MERGE_NOTE;
+  // CR-29: two-stage fetch is the standard read for EVERY profile.
+  obj.fetch_policy = "two_stage_text_then_browser";
+  obj.link_fetch_note = LINK_FETCH_FALLBACK_NOTE;
+  obj.fetch_fallback_note = LINK_FETCH_FALLBACK_NOTE;
+  obj.note = SPEECH_MERGE_NOTE + " " + LINK_FETCH_FALLBACK_NOTE;
+  obj.flavor_note = FLAVOR_PAYLOAD_NOTE;
+  // CR-19: only when 「演じる姿・状況」 is set (and its bias is not
+  // failed, CR-21) — material-based generation uses only the matching
+  // parts of the sources. When unset, no portrayal keys are added.
+  Object.assign(obj, portrayalFields(data, portrayalGenerationNote));
+  // CR-21 addendum 2: only for the repair re-queue of a
+  // portrayal_focus removal.
+  if (opts?.memoryRepair) Object.assign(obj, portrayalMemoryRepairFields(data));
+  return JSON.stringify(obj);
+}
+
+// Build the trial_conversation payload for a profile. Same value
+// priority as buildLinkSummaryPayload; unlike link_summary, the
+// caller's `note` is kept (the server never overwrites it). On top of
+// the shared tone material, the payload always carries the CR-22
+// address_note (trial is an acting kind) and the F-4 base_greeting
+// pin — opts.baseGreeting lets createGenerationRequest preserve the
+// ORIGINAL pin when it refreshes an already-pending request;
+// otherwise the profile's current greeting is pinned.
+function buildTrialPayload(
+  data: ProfileData,
+  callerValues?: Record<string, unknown>,
+  opts?: { baseGreeting?: string },
+): string {
+  const obj: Record<string, unknown> = { ...(callerValues ?? {}) };
+  Object.assign(obj, toneMaterialFields(data));
+  obj.user_relationship_note = USER_RELATIONSHIP_NOTE;
+  obj.video_notes_note = VIDEO_NOTES_NOTE;
+  obj.speech_note = SPEECH_PAYLOAD_NOTE;
+  obj.speech_merge_note = SPEECH_MERGE_NOTE;
+  // CR-29: trial payloads carry the same two-stage fetch fields (the
+  // greeting/tone inference reads the same background links).
+  obj.fetch_policy = "two_stage_text_then_browser";
+  obj.link_fetch_note = LINK_FETCH_FALLBACK_NOTE;
+  obj.fetch_fallback_note = LINK_FETCH_FALLBACK_NOTE;
+  obj.flavor_note = FLAVOR_PAYLOAD_NOTE;
+  // CR-19: acting — respond in the portrayal/situation (no keys when
+  // unset or failed, CR-21).
+  Object.assign(obj, portrayalFields(data, portrayalActingNote));
+  // CR-22: the standing address note, for every profile.
+  obj.address_note = ADDRESS_NOTE;
+  // F-4 (TC-19): pin the greeting as it stands at queue time.
+  obj.base_greeting = opts?.baseGreeting ?? data.greeting;
+  return JSON.stringify(obj);
+}
+
+// ---------------------------------------------------------------------------
+// D-1: the preparation-request guarantee (ensurePreparationRequests)
+// ---------------------------------------------------------------------------
+
+// The standing promise: a preparation item that derives as "pending"
+// ALWAYS has an open (pending / processing) generation request behind
+// it. This function enforces the promise at the end of every write
+// path that can leave an item pending (creation, duplication,
+// restore, edit save) — it re-reads the profile, derives the items
+// with calcPreparation, counts the open requests of each kind
+// DIRECTLY in generation_requests (no list cap, no list action), and
+// inserts exactly one fresh request for each pending item that has
+// none. It is INSERT-ONLY with respect to request rows: an existing
+// request row is never updated or replaced here (refreshing belongs
+// to the explicit queue paths). It does not write the profile row
+// itself either — with two exceptions, both in the video paths: the
+// video queueing path goes through queueVideoTranscriptRequest,
+// which may write the profile row (the video hint flip) as part of
+// queueing, and the video branch with no unprocessed URLs left
+// writes the profile row to record the item's failure. Either write
+// can advance updatedAt.
+// Trashed profiles get nothing. chara_chat_sync, image_generation,
+// profile_apply, flavor_examples and switch requests are out of
+// scope — they have their own queueing rules.
+async function ensurePreparationRequests(
+  ctx: Ctx,
+  profileId: string,
+): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.profiles)
+    .where(eq(schema.profiles.id, profileId))
+    .limit(1);
+  const row = rows[0];
+  if (!row || row.deletedAt) return;
+  const data = parseData(row.data);
+  const prep = calcPreparation(data);
+  if (
+    prep.link_summary !== "pending" &&
+    prep.greeting !== "pending" &&
+    prep.video !== "pending"
+  )
+    return;
+  const openRows = await db
+    .select({ kind: schema.generationRequests.kind })
+    .from(schema.generationRequests)
+    .where(
+      and(
+        eq(schema.generationRequests.profileId, profileId),
+        inArray(schema.generationRequests.status, ["pending", "processing"]),
+      ),
+    );
+  const openKinds = new Set(openRows.map((r) => r.kind));
+  const now = new Date();
+  if (prep.link_summary === "pending" && !openKinds.has("link_summary")) {
+    // Caller values come from the stored profile (D-2: the guarantee
+    // path is the one place the seven keys are filled server-side).
+    await insertPendingGenerationRequest(db, {
+      id: newId("gen"),
+      profileId,
+      kind: "link_summary",
+      payload: buildLinkSummaryPayload(data, {
+        links: data.background.links,
+      }),
+      now,
+    });
+  }
+  if (prep.greeting === "pending" && !openKinds.has("trial_conversation")) {
+    await insertPendingGenerationRequest(db, {
+      id: newId("gen"),
+      profileId,
+      kind: "trial_conversation",
+      payload: buildTrialPayload(data, {
+        name: row.name,
+        speech_style: data.speech.style,
+        tuning: data.speech.tuning,
+        call_user_as: data.call_user_as,
+        background: data.background.text,
+        links: data.background.links,
+        note: TRIAL_CREATE_NOTE,
+      }),
+      now,
+    });
+  }
+  if (prep.video === "pending" && !openKinds.has("video_transcript")) {
+    if (unprocessedVideoUrls(data).length === 0) {
+      // M-6: derived pending with nothing left to process and no open
+      // request — this state is normally produced only by deleting a
+      // (force) request, which D-4 already turns into a failure at
+      // deletion time. As a second safety net, do not queue a request
+      // that could never complete; instead mark the item failed with
+      // a reason, in the same stored form failOrphanedPreparationItem
+      // uses (preparation + preparation_errors via withPreparation).
+      data.preparation = { ...data.preparation, video: "failed" };
+      data.preparation_errors = {
+        ...data.preparation_errors,
+        video: "処理対象の動画がありません。再試行してください",
+      };
+      await db
+        .update(schema.profiles)
+        .set({
+          data: JSON.stringify(withPreparation(data)),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.profiles.id, profileId));
+    } else {
+      await queueVideoTranscriptRequest(ctx, profileId, row.name, data);
+    }
+  }
+}
+
+// D-4: after a request is deleted or a write-back completes, an item
+// whose kind has NO open request left but which still derives as
+// "pending" would sit at 準備中 forever — turn it into a failure with
+// a reason, in the same stored form importProfile's R-14.3 conversion
+// uses (preparation + preparation_errors, written through
+// withPreparation). Trashed profiles are never failed this way. When
+// another open request of the kind remains, or the item no longer
+// derives as pending, nothing happens.
+// Scope (medium-1): ONLY link_summary / trial_conversation /
+// video_transcript are failed this way. image_generation is excluded
+// on purpose — deleting an image request must not fail the image
+// item, and dismissing a failed image_generation request keeps the
+// CR-15 behavior (the failure is cleared and stays cleared).
+async function failOrphanedPreparationItem(
+  ctx: Ctx,
+  profileId: string,
+  kind: GenRow["kind"],
+  reason: string,
+): Promise<void> {
+  if (
+    kind !== "link_summary" &&
+    kind !== "trial_conversation" &&
+    kind !== "video_transcript"
+  )
+    return;
+  const kindKey = prepKeyForKind(kind);
+  if (!kindKey) return;
+  const db = ctx.db<typeof schema>();
+  const remaining = await db
+    .select({ status: schema.generationRequests.status })
+    .from(schema.generationRequests)
+    .where(
+      and(
+        eq(schema.generationRequests.profileId, profileId),
+        eq(schema.generationRequests.kind, kind),
+      ),
+    );
+  if (remaining.some((r) => isOpenStatus(r.status))) return;
+  const prof = await db
+    .select()
+    .from(schema.profiles)
+    .where(eq(schema.profiles.id, profileId))
+    .limit(1);
+  if (!prof[0] || prof[0].deletedAt) return;
+  const data = parseData(prof[0].data);
+  if (calcPreparation(data)[kindKey] !== "pending") return;
+  data.preparation = { ...data.preparation, [kindKey]: "failed" };
+  data.preparation_errors = {
+    ...data.preparation_errors,
+    [kindKey]: reason,
+  };
+  await db
+    .update(schema.profiles)
+    .set({
+      data: JSON.stringify(withPreparation(data)),
+      updatedAt: new Date(),
+    })
+    .where(eq(schema.profiles.id, profileId));
 }
 
 // CR-10 read/write normalization: an invalid color falls back to the
@@ -2228,6 +2781,26 @@ function mergePreservingManagedFields(
   if (out.chara_chat_sync === null && before.chara_chat_sync !== null) {
     out.chara_chat_sync = before.chara_chat_sync;
   }
+  // F-3: the avatar_memory revision is server-managed (it advances
+  // only in generation write-backs) — a form or stub payload never
+  // moves it, so the stored value always wins here. updateProfile's
+  // stale-form check compares the request's own revision argument
+  // against `before`, not this field.
+  out.avatar_memory_revision = before.avatar_memory_revision ?? 0;
+  // F-6: the deletion records are likewise server-managed here — the
+  // stored records are the starting point, and updateProfile's
+  // tombstone bookkeeping (record additions for content this save
+  // removed, releases for content manually re-entered) runs on top of
+  // them after this merge. A payload can never wipe or rewrite them.
+  out.deletion_records = {
+    catchphrases: [...(before.deletion_records?.catchphrases ?? [])],
+    flavor_labels: [...(before.deletion_records?.flavor_labels ?? [])],
+    flavor_examples: Object.fromEntries(
+      Object.entries(before.deletion_records?.flavor_examples ?? {}).map(
+        ([label, lines]) => [label, [...lines]],
+      ),
+    ),
+  };
   // CR-28: the merged images list is the current truth — the generation
   // reference (image_base.image_ref) follows its effective primary
   // entry, so a payload carrying a stale image_ref (e.g. the edit
@@ -2268,6 +2841,11 @@ const profileOutSchema = z.object({
   theme_color_source: themeColorSourceSchema,
   voice: profileDataSchema.shape.voice,
   avatar_memory: z.string(),
+  // F-3: the avatar_memory revision the edit form holds and sends
+  // back with its save (see updateProfile).
+  avatar_memory_revision: z.number(),
+  // F-6: the deletion records (tombstones) for removed auto content.
+  deletion_records: profileDataSchema.shape.deletion_records,
   switch_settings: profileDataSchema.shape.switch_settings,
   origin: profileDataSchema.shape.origin,
   candidate_id: z.string().nullable(),
@@ -2437,11 +3015,13 @@ async function buildReferenceImage(
   if (primary) {
     let url: string | null = null;
     if (primary.blob_key) {
-      try {
-        url = await ctx.blobs.getUrl(primary.blob_key);
-      } catch {
-        url = null;
-      }
+      // F-9: same re-attachment as the profile reads — when the
+      // primary's blob is gone (e.g. a history-restored entry whose
+      // image was deleted afterwards), the surviving thumbnail's
+      // serving URL is handed over instead of null, so the switch /
+      // generation payload never carries an unopenable reference
+      // without the chat side being able to open anything.
+      url = await resolveEntryUrl(ctx, primary);
     } else if (/^https?:\/\//.test(primary.file)) {
       url = primary.file;
     }
@@ -2516,6 +3096,32 @@ async function ensureThumbUrl(
   } catch {
     return null;
   }
+}
+
+// F-9 (TC-28b): resolve the serving URL for one stored image entry.
+// The normal path is the entry's own blob (ctx.blobs.getUrl, the same
+// method every other path uses). When the blob itself is gone — the
+// classic case is a history restore that revived an entry whose image
+// was deleted afterwards (removeImage deletes the blob), leaving
+// blob_key set but every read handing out url: null — the entry's
+// thumbnail is the surviving copy of that image: thumbnails are
+// content-addressed under thumbs/ and are never deleted with the
+// original, so its serving URL is re-attached instead. Read-side
+// repair only: the stored entry is never modified, and when neither
+// blob exists the result stays null exactly as before.
+async function resolveEntryUrl(
+  ctx: Ctx,
+  img: Pick<ImageEntry, "blob_key" | "file" | "source">,
+): Promise<string | null> {
+  if (img.blob_key) {
+    try {
+      return await ctx.blobs.getUrl(img.blob_key);
+    } catch {
+      // Blob gone — fall through to the thumbnail repair below.
+    }
+    return await ensureThumbUrl(ctx, img);
+  }
+  return null;
 }
 
 // CR-25 (follow-up): pre-generate the primary image's thumbnail at
@@ -2655,14 +3261,10 @@ async function toProfileOut(
   ): Promise<z.infer<typeof profileOutSchema>["images"][number]> => {
     // A missing blob (e.g. an image_ref recovered after D-02 whose blob
     // is gone) must not take the whole profile read down with it.
-    let url: string | null = null;
-    if (img.blob_key) {
-      try {
-        url = await ctx.blobs.getUrl(img.blob_key);
-      } catch {
-        url = null;
-      }
-    }
+    // F-9: when the blob is gone but the entry's thumbnail survives
+    // (history restore of a since-deleted image), the thumbnail's
+    // serving URL is re-attached so the entry is openable again.
+    const url = await resolveEntryUrl(ctx, img);
     const thumb_url =
       primaryEntry && img.id === primaryEntry.id
         ? await ensureThumbUrl(ctx, img)
@@ -2726,6 +3328,12 @@ async function toProfileOut(
     theme_color_source: data.theme_color_source ?? "default",
     voice: data.voice,
     avatar_memory: opts?.light ? "" : data.avatar_memory,
+    avatar_memory_revision: data.avatar_memory_revision ?? 0,
+    deletion_records: data.deletion_records ?? {
+      catchphrases: [],
+      flavor_labels: [],
+      flavor_examples: {},
+    },
     switch_settings: {
       pass_conversation_summary: false,
       use_shared_info: data.switch_settings.use_shared_info,
@@ -3024,12 +3632,61 @@ async function toGenOutMany(
       .where(inArray(schema.profiles.id, ids));
     for (const p of profs) nameById.set(p.id, p.name);
   }
-  return rows.map((row) =>
-    buildGenOut(
+  // F-2 (TC-22/24): a profile_apply request's reference_image /
+  // image_ref are NOT frozen at creation time — they are resolved
+  // HERE, at read time, from the profile's CURRENT primary image,
+  // exactly like switch requests resolve theirs in toSwitchOutMany.
+  // (Freezing them meant an apply queued before a representative-
+  // image change generated from the old image.) Every other payload
+  // field — name, tone, and the rest — stays frozen at creation, and
+  // the stored payload itself is never rewritten: the resolution
+  // happens only in this output assembly.
+  const payloadOverride = new Map<string, string>();
+  const applyRows = rows.filter(
+    (r) => r.kind === "profile_apply" && r.profileId,
+  );
+  if (applyRows.length > 0) {
+    const db = ctx.db<typeof schema>();
+    const applyIds = [
+      ...new Set(applyRows.map((r) => r.profileId as string)),
+    ];
+    const profs = await db
+      .select({ id: schema.profiles.id, data: schema.profiles.data })
+      .from(schema.profiles)
+      .where(inArray(schema.profiles.id, applyIds));
+    const dataById = new Map(profs.map((p) => [p.id, parseData(p.data)]));
+    for (const row of applyRows) {
+      const data = row.profileId ? dataById.get(row.profileId) : undefined;
+      if (!data) continue;
+      let obj: Record<string, unknown>;
+      try {
+        const p = JSON.parse(row.payload) as unknown;
+        if (!p || typeof p !== "object" || Array.isArray(p)) continue;
+        obj = p as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const { ref_value, reference } = await buildReferenceImage(ctx, data);
+      obj.reference_image = reference;
+      obj.reference_image_note = reference ? REFERENCE_IMAGE_NOTE : null;
+      if (ref_value !== null) {
+        obj.image_ref = ref_value;
+        const base = obj.image_base;
+        if (base && typeof base === "object" && !Array.isArray(base)) {
+          (base as Record<string, unknown>).image_ref = ref_value;
+        }
+      }
+      payloadOverride.set(row.id, JSON.stringify(obj));
+    }
+  }
+  return rows.map((row) => {
+    const out = buildGenOut(
       row,
       row.profileId ? (nameById.get(row.profileId) ?? null) : null,
-    ),
-  );
+    );
+    const payload = payloadOverride.get(row.id);
+    return payload ? { ...out, payload } : out;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -3206,7 +3863,9 @@ async function queueCharaSyncIfTargetFound(
 // registerProfile, in this exact order: reload the stored row,
 // pre-generate the primary image's thumbnail (CR-25), queue
 // flavor_examples for traits that need them (CR-12), queue
-// video_transcript for uncovered reference videos (CR-17), and — only
+// video_transcript for uncovered reference videos (CR-17), run the
+// preparation guarantee (D-1: link_summary / greeting / video items
+// still pending without an open request get one), and — only
 // when syncToCharaChat is true — queue the chara_chat_sync reflection
 // against a discovered target (CR-24). With opts.deferCharaSync the
 // chara_chat_sync step is skipped entirely (the stored preference is
@@ -3236,6 +3895,12 @@ async function runPostCreateTasks(
     row.name,
     data,
   );
+  // D-1/D-3: the preparation guarantee runs AFTER flavor/video and
+  // BEFORE chara_chat_sync (the sync stays last, R-4): any item that
+  // derives as pending without an open request — above all
+  // link_summary and the greeting, which no server path queued before
+  // — gets exactly one request here, whichever creation path ran.
+  await ensurePreparationRequests(ctx, id);
   let charaSyncRequestId: string | null = null;
   let charaTargetSlug: string | null = null;
   if (syncToCharaChat && !opts.deferCharaSync) {
@@ -3306,6 +3971,8 @@ export const Actions = {
     }),
     privileged: [privileged.makeThumbnail],
     async handler(ctx, args) {
+      // F-12: lazily purge trash entries past the 30-day retention.
+      await purgeExpiredTrash(ctx);
       const db = ctx.db<typeof schema>();
       const rows = await db
         .select()
@@ -3360,7 +4027,7 @@ export const Actions = {
 
   createProfile: defineAction({
     description:
-      "Creates a new avatar profile from the create/edit form input and returns its id. CR-10: data.theme_color / theme_color_source carry the theme color — auto (acquired from the representative image's dominant color or inferred from the appearance elements), manual (user-picked, never auto-overwritten), or default (fallback color). CR-12: if any flavor trait has auto_examples on and no examples yet, a flavor_examples generation request is queued for the new profile (see updateProfile). CR-17: if the profile carries 参考動画URL (background.video_urls) that no transcript attempt has covered yet, exactly one video_transcript generation request is queued for it (payload: the video URLs plus name / background summary / current speech as context) and its id is returned as video_transcript_request_id. CR-24: with sync_to_chara_chat=true (the form's 「キャラチャットに反映する」 checkbox), the value is stored as the profile's chara_chat_sync preference, but createProfile itself queues no chara_chat_sync request and always returns chara_chat_sync_request_id / chara_chat_target_slug as null: the actual queueing happens only after the create form's follow-up steps (image registration and the image_generation / link_summary / trial_conversation requests) have all completed, when the client calls createGenerationRequest(kind: \"chara_chat_sync\") — that call discovers the receiver under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction, whose protocol response the mediator verifies before pushing; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus), queues exactly one request (mediator kicked immediately; payload carries the DISCOVERED target slug), so the reflection carries the finished profile. Creation itself is unaffected either way.",
+      "Creates a new avatar profile from the create/edit form input and returns its id. CR-10: data.theme_color / theme_color_source carry the theme color — auto (acquired from the representative image's dominant color or inferred from the appearance elements), manual (user-picked, never auto-overwritten), or default (fallback color). CR-12: if any flavor trait has auto_examples on and no examples yet, a flavor_examples generation request is queued for the new profile (see updateProfile). CR-17: if the profile carries 参考動画URL (background.video_urls) that no transcript attempt has covered yet, exactly one video_transcript generation request is queued for it (payload: the video URLs plus name / background summary / current speech as context) and its id is returned as video_transcript_request_id. CR-24: with sync_to_chara_chat=true (the form's 「キャラチャットに反映する」 checkbox), the value is stored as the profile's chara_chat_sync preference, but createProfile itself queues no chara_chat_sync request and always returns chara_chat_sync_request_id / chara_chat_target_slug as null: the actual queueing happens only after the create form's follow-up steps (image registration and the image_generation / link_summary / trial_conversation requests) have all completed, when the client calls createGenerationRequest(kind: \"chara_chat_sync\") — that call discovers the receiver under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction, whose protocol response the mediator verifies before pushing; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus), queues exactly one request (mediator kicked immediately; payload carries the DISCOVERED target slug), so the reflection carries the finished profile. Creation itself is unaffected either way. D-1: the server also runs the preparation guarantee during creation (after flavor/video queueing, before the deferred sync step) — a link_summary request when the profile has background links and no summary yet, and a trial_conversation request while the greeting is empty, are each queued exactly once server-side, so creation no longer depends on the client's follow-up calls for those kinds.",
     request: profileInputSchema,
     response: z.object({
       id: z.string(),
@@ -3449,7 +4116,7 @@ export const Actions = {
 
   updateProfile: defineAction({
     description:
-      "Partially updates a profile's editable fields, first saving the previous version into its history (latest 20 kept). Fields the payload leaves empty keep their stored values (D-02): images, greeting, link_summary, avatar_memory, candidate_id, summary, background text/links, call_user_as, speech style, voice kind/speed, and the whole image_base (type, image_ref, and all 13 elements — a default-stub image_base never overwrites a stored one). List a field in allow_clear to clear it intentionally (\"image_base\" / \"elements\" / \"elements:<key>\" / \"image_ref\" address the image base). If background.links were added or changed and are non-empty, a link_summary regeneration request is queued automatically and preparation returns to pending; link_summary_requeued in the response reports whether that happened. CR-03: with apply_now=true the save also queues exactly one immediate-apply request — a profile_apply generation request (payload: image_ref, primary image, name, speech style, call_user_as) when the profile is active, or a normal switch request when it is not; apply_kind/apply_request_id in the response report which. apply_now=false (default) is save-only. CR-04: apply_phrase carries the canned phrase for that request (paste it into chat to trigger it). CR-06: speech carries structured fields (structured.first_person/second_person/catchphrase/memo plus top-level call_user_as and speech.style) with per-field sources (speech.sources: auto/manual/null); values changed through this action become manual and are protected from generation write-backs, empty speech fields keep stored values unless listed in allow_clear (speech_first_person / speech_second_person / speech_catchphrase / speech_memo), and the profile_apply payload includes the merged speech fields (speech / speech_structured / speech_sources). CR-07: background.user_relationship is the optional 「私の扱い」 (what the user is to this character — master, friend, …); it is preserved on empty like the other background fields (allow_clear: \"user_relationship\" clears it intentionally), is carried in the auto link_summary requeue payload and in the profile_apply payload (user_relationship / background_user_relationship), and switch requests expose it on their output for the chat side. CR-08: data.flavor is the フレーバー設定 {level 0-5 (default 3), traits[{id, label, examples[], scenes[], enabled, source auto/manual}]}; traits added/changed through this action become manual (protected from generation write-backs), an empty traits payload keeps the stored flavor unless allow_clear lists \"flavor_traits\", and the profile_apply payload includes the merged flavor (flavor / flavor_level / flavor_traits / flavor_enabled_traits: level + enabled traits only). CR-10: data carries theme_color (#rrggbb) + theme_color_source (auto/manual/default); a manual theme color is never overwritten by automatic acquisition or stub payloads (list \"theme_color\" in allow_clear when the user changed it or returned it to automatic on purpose), and a still-default profile is initialized from its appearance elements on read. CR-14: each flavor trait also carries frequency (0-5 or null; null = follow the global level, a number overrides it for that trait only, same stage meanings as the global bar). Switch output, profile_apply payloads, and generation payloads carry per-trait effective_frequency (frequency ?? level) and frequency_is_custom; a trait with effective_frequency 0 is handed over with 0 explicitly and must be treated like a disabled trait (never shown). Legacy traits parse with frequency null, so existing profiles behave exactly as before. CR-12: each flavor trait carries auto_examples (「例文を自動作成」); when a save leaves any trait with auto_examples on and no examples, a flavor_examples generation request is queued for the profile (an already-open one is refreshed with the current targets instead of duplicated) and its id is returned as flavor_examples_request_id. The request payload carries the target traits (id/label/scenes) plus speech, summary, background summary, and user_relationship as context. CR-17: background carries video_urls (参考動画URL, kept separate from links), video_notes (tone findings from the videos' dialogue), unreadable_videos, and video_processed_urls; video_urls are preserved on empty like links (allow_clear: \"video_urls\" clears them intentionally) and the generation-managed video fields survive stub payloads. When a save leaves any video URL no transcript attempt has covered, exactly one video_transcript generation request is queued or refreshed for the profile and its id is returned as video_transcript_request_id; the profile_apply payload and the auto link_summary requeue carry video_notes as tone reference material. CR-23: video_urls may include YouTube playlist URLs (youtube.com/playlist?list=…); they are stored and queued like any other video URL, and the video_transcript payload flags them (playlist_urls + playlist_note) so the chat side transcribes every video in the list. CR-19: background.portrayal_focus is the optional 「演じる姿・状況」 (a specific portrayal/situation to bias toward — 中学生の時のみ / 闇落ちした状態 / もしものif設定 etc.); it is preserved on empty like user_relationship (allow_clear: \"portrayal_focus\" clears it intentionally). Only when set: generation payloads carry portrayal_focus + portrayal_focus_note (use ONLY the material matching that portrayal/situation; for videos pick the matching chapters/segments; if nothing matches, report that in the write-back instead of filling from other states), and the profile_apply payload carries it with the acting premise (respond in that portrayal/situation). When empty, no portrayal keys or bias instructions appear anywhere and behavior is exactly as before. CR-20: when portrayal_focus actually changes in a save (set, changed, or cleared), re-inference is queued under the new bias — a link_summary request is re-queued when the profile has background links, and a video_transcript request is re-queued with force (already-processed videos included) when it has reference videos; a save that leaves the value unchanged queues neither for this reason. CR-21: background also carries the portrayal check state (portrayal_focus_status: unknown/ok/failed, portrayal_focus_failure_reason, portrayal_focus_checks {link_summary, video_transcript: match/no_match/null}) — it is generation-managed (write-backs and this action's reset are the only writers; payloads cannot set it). When portrayal_focus actually changes, the state resets to unknown with no checks and no reason, and the CR-20 re-queue re-judges it. While the state is failed, the bias is inactive: the profile_apply payload built here carries no portrayal keys, exactly like an unused field. CR-21 addendum: CLEARING portrayal_focus (empty value + allow_clear) counts as a change exactly like setting/editing it — including while the state is failed, the reset and the re-queue (link_summary when links exist, video_transcript with force when videos exist) always fire together, so the full-material write-backs that follow restore link_summary / video_notes to normal content and the failed state/badge clears. CR-21 addendum 2: the set → cleared transition is additionally a repair trigger for avatar_memory — the re-queue payloads fired by that save (link_summary and/or video_transcript) carry the current avatar_memory with avatar_memory_repair: true and an instruction to remove any elements written into the memory because of the removed specification (keeping all other facts) and return the repaired text as the write-back's avatar_memory. A save where portrayal_focus does not actually change fires no re-queue and no memory repair, and profiles that never had a focus are completely unaffected. CR-22: the profile_apply payload queued with apply_now=true always carries address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方), for every profile regardless of its call_user_as / second_person settings; it is a handover note only and changes no stored profile data. CR-24: the request also accepts sync_to_chara_chat (the edit form's 「キャラチャットに反映する」 checkbox): when present it becomes the stored data.chara_chat_sync preference (an absent value preserves the stored preference; a payload leaving the data field null likewise), and when true this save additionally queues (or refreshes) exactly one chara_chat_sync generation request for the profile — but only when a receiver app is discovered in this environment under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction, whose protocol response the mediator verifies before pushing; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus; no fixed destination); the request payload and the kicked mediator carry the DISCOVERED target slug, and chara_chat_sync_request_id / chara_chat_target_slug in the response report the outcome (both null when off, absent, trashed, or no target found). data.chara_chat_synced_at is write-back-managed (only a completed chara_chat_sync write-back sets it) and survives every payload. CR-28: while the profile has images, image_base.image_ref is not an independent value — after the merge it is re-derived from the effective primary image entry (its blob_key ?? file), so a stale image_ref carried by the payload (e.g. the edit form's load-time value for an image the user has since deleted) cannot survive the save; the profile_apply payload likewise resolves its generation reference from the current primary image (reference_image — uploads carry an openable url alongside the internal blob_key) and carries reference_image_note, which forbids substituting any other image found in the profile and requires a failed write-back when the reference cannot be obtained.",
+      "Partially updates a profile's editable fields, first saving the previous version into its history (latest 20 kept). Fields the payload leaves empty keep their stored values (D-02): images, greeting, link_summary, avatar_memory, candidate_id, summary, background text/links, call_user_as, speech style, voice kind/speed, and the whole image_base (type, image_ref, and all 13 elements — a default-stub image_base never overwrites a stored one). List a field in allow_clear to clear it intentionally (\"image_base\" / \"elements\" / \"elements:<key>\" / \"image_ref\" address the image base). If background.links were added or changed and are non-empty, a link_summary regeneration request is queued automatically and preparation returns to pending; link_summary_requeued in the response reports whether that happened. CR-03: with apply_now=true the save also queues exactly one immediate-apply request — a profile_apply generation request (payload: image_ref, primary image, name, speech style, call_user_as) when the profile is active, or a normal switch request when it is not; apply_kind/apply_request_id in the response report which. apply_now=false (default) is save-only. CR-04: apply_phrase carries the canned phrase for that request (paste it into chat to trigger it). CR-06: speech carries structured fields (structured.first_person/second_person/catchphrase/memo plus top-level call_user_as and speech.style) with per-field sources (speech.sources: auto/manual/null); values changed through this action become manual and are protected from generation write-backs, empty speech fields keep stored values unless listed in allow_clear (speech_first_person / speech_second_person / speech_catchphrase / speech_memo), and the profile_apply payload includes the merged speech fields (speech / speech_structured / speech_sources). CR-07: background.user_relationship is the optional 「私の扱い」 (what the user is to this character — master, friend, …); it is preserved on empty like the other background fields (allow_clear: \"user_relationship\" clears it intentionally), is carried in the auto link_summary requeue payload and in the profile_apply payload (user_relationship / background_user_relationship), and switch requests expose it on their output for the chat side. CR-08: data.flavor is the フレーバー設定 {level 0-5 (default 3), traits[{id, label, examples[], scenes[], enabled, source auto/manual}]}; traits added/changed through this action become manual (protected from generation write-backs), an empty traits payload keeps the stored flavor unless allow_clear lists \"flavor_traits\", and the profile_apply payload includes the merged flavor (flavor / flavor_level / flavor_traits / flavor_enabled_traits: level + enabled traits only). CR-10: data carries theme_color (#rrggbb) + theme_color_source (auto/manual/default); a manual theme color is never overwritten by automatic acquisition or stub payloads (list \"theme_color\" in allow_clear when the user changed it or returned it to automatic on purpose), and a still-default profile is initialized from its appearance elements on read. CR-14: each flavor trait also carries frequency (0-5 or null; null = follow the global level, a number overrides it for that trait only, same stage meanings as the global bar). Switch output, profile_apply payloads, and generation payloads carry per-trait effective_frequency (frequency ?? level) and frequency_is_custom; a trait with effective_frequency 0 is handed over with 0 explicitly and must be treated like a disabled trait (never shown). Legacy traits parse with frequency null, so existing profiles behave exactly as before. CR-12: each flavor trait carries auto_examples (「例文を自動作成」); when a save leaves any trait with auto_examples on and no examples, a flavor_examples generation request is queued for the profile (an already-open one is refreshed with the current targets instead of duplicated) and its id is returned as flavor_examples_request_id. The request payload carries the target traits (id/label/scenes) plus speech, summary, background summary, and user_relationship as context. CR-17: background carries video_urls (参考動画URL, kept separate from links), video_notes (tone findings from the videos' dialogue), unreadable_videos, and video_processed_urls; video_urls are preserved on empty like links (allow_clear: \"video_urls\" clears them intentionally) and the generation-managed video fields survive stub payloads. When a save leaves any video URL no transcript attempt has covered, exactly one video_transcript generation request is queued or refreshed for the profile and its id is returned as video_transcript_request_id; the profile_apply payload and the auto link_summary requeue carry video_notes as tone reference material. CR-23: video_urls may include YouTube playlist URLs (youtube.com/playlist?list=…); they are stored and queued like any other video URL, and the video_transcript payload flags them (playlist_urls + playlist_note) so the chat side transcribes every video in the list. CR-19: background.portrayal_focus is the optional 「演じる姿・状況」 (a specific portrayal/situation to bias toward — 中学生の時のみ / 闇落ちした状態 / もしものif設定 etc.); it is preserved on empty like user_relationship (allow_clear: \"portrayal_focus\" clears it intentionally). Only when set: generation payloads carry portrayal_focus + portrayal_focus_note (use ONLY the material matching that portrayal/situation; for videos pick the matching chapters/segments; if nothing matches, report that in the write-back instead of filling from other states), and the profile_apply payload carries it with the acting premise (respond in that portrayal/situation). When empty, no portrayal keys or bias instructions appear anywhere and behavior is exactly as before. CR-20: when portrayal_focus actually changes in a save (set, changed, or cleared), re-inference is queued under the new bias — a link_summary request is re-queued when the profile has background links, and a video_transcript request is re-queued with force (already-processed videos included) when it has reference videos; a save that leaves the value unchanged queues neither for this reason. CR-21: background also carries the portrayal check state (portrayal_focus_status: unknown/ok/failed, portrayal_focus_failure_reason, portrayal_focus_checks {link_summary, video_transcript: match/no_match/null}) — it is generation-managed (write-backs and this action's reset are the only writers; payloads cannot set it). When portrayal_focus actually changes, the state resets to unknown with no checks and no reason, and the CR-20 re-queue re-judges it. While the state is failed, the bias is inactive: the profile_apply payload built here carries no portrayal keys, exactly like an unused field. CR-21 addendum: CLEARING portrayal_focus (empty value + allow_clear) counts as a change exactly like setting/editing it — including while the state is failed, the reset and the re-queue (link_summary when links exist, video_transcript with force when videos exist) always fire together, so the full-material write-backs that follow restore link_summary / video_notes to normal content and the failed state/badge clears. CR-21 addendum 2: the set → cleared transition is additionally a repair trigger for avatar_memory — the re-queue payloads fired by that save (link_summary and/or video_transcript) carry the current avatar_memory with avatar_memory_repair: true and an instruction to remove any elements written into the memory because of the removed specification (keeping all other facts) and return the repaired text as the write-back's avatar_memory. A save where portrayal_focus does not actually change fires no re-queue and no memory repair, and profiles that never had a focus are completely unaffected. CR-22: the profile_apply payload queued with apply_now=true always carries address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方), for every profile regardless of its call_user_as / second_person settings; it is a handover note only and changes no stored profile data. CR-24: the request also accepts sync_to_chara_chat (the edit form's 「キャラチャットに反映する」 checkbox): when present it becomes the stored data.chara_chat_sync preference (an absent value preserves the stored preference; a payload leaving the data field null likewise), and when true this save additionally queues (or refreshes) exactly one chara_chat_sync generation request for the profile — but only when a receiver app is discovered in this environment under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction, whose protocol response the mediator verifies before pushing; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus; no fixed destination); the request payload and the kicked mediator carry the DISCOVERED target slug, and chara_chat_sync_request_id / chara_chat_target_slug in the response report the outcome (both null when off, absent, trashed, or no target found). data.chara_chat_synced_at is write-back-managed (only a completed chara_chat_sync write-back sets it) and survives every payload. CR-28: while the profile has images, image_base.image_ref is not an independent value — after the merge it is re-derived from the effective primary image entry (its blob_key ?? file), so a stale image_ref carried by the payload (e.g. the edit form's load-time value for an image the user has since deleted) cannot survive the save; the profile_apply payload likewise resolves its generation reference from the current primary image (reference_image — uploads carry an openable url alongside the internal blob_key) and carries reference_image_note, which forbids substituting any other image found in the profile and requires a failed write-back when the reference cannot be obtained. F-1: after the save, any still-pending trial_conversation request for the profile has its tone material (structured speech, call_user_as, user_relationship, flavor, tuning) rebuilt in place from the just-saved profile — status unchanged, no new request, processing requests stay frozen; its base_greeting pin (F-4) is preserved. F-3: the request may carry avatar_memory_revision (the revision the edit form loaded); when it is older than the stored revision and the submitted avatar_memory differs from the stored one, the memory change is ignored and the stored memory kept (other fields save as usual) — an intentional clear via allow_clear still applies, and callers sending no revision are unaffected. F-5: with sync_to_chara_chat=false, the profile's still-pending chara_chat_sync requests are deleted (processing ones are untouched). F-6: the save maintains deletion records (data.deletion_records: catchphrases / flavor_labels / flavor_examples) — auto catchphrase items, auto flavor traits, and generated example lines that this save removed are recorded so generation write-backs cannot resurrect them, and manually re-entering the same content releases its record; a trait whose generated examples the user emptied (record present) is no longer auto-re-queued for flavor_examples. F-11: when the save leaves background.video_urls empty, background.video_notes and video_processed_urls are cleared with them (matching the all-links-removed behavior for link_summary). CR-29: the auto link_summary requeue queued by this save carries the standard two-stage fetch instruction (fetch_policy two_stage_text_then_browser + link_fetch_note / fetch_fallback_note, also inside note) — stage 1 is the existing text fetch, stage 2 is a real browser for any URL stage 1 could not read, and a URL may be written back as unreadable only after both stages failed, with both stages' failure details in the reason. The same instruction is carried by every link_summary payload (see createGenerationRequest) and, in its transcript variant, by every video_transcript payload, for every profile. D-1: at the very end of the save (after the F-1 payload refresh, the link re-queue and the video queueing), the preparation guarantee queues exactly one request for any preparation item (link_summary / greeting / video) that derives as pending without an open request; the guarantee is insert-only for requests, but in the video paths it may write the profile row (queueing via the video path, and recording a failure in the no-unprocessed-URLs branch), which can advance updatedAt. D-2: the auto link_summary requeue payload is assembled by the shared buildLinkSummaryPayload (the same builder createGenerationRequest and the guarantee use).",
     request: z.object({
       id: z.string().min(1),
       name: z.string().trim().min(1).max(100),
@@ -3473,6 +4140,14 @@ export const Actions = {
       // environment. When absent (agent-side stub saves), the stored
       // preference is preserved and nothing is queued.
       sync_to_chara_chat: z.boolean().optional(),
+      // F-3: the avatar_memory revision the edit form loaded with the
+      // profile. When it is older than the stored revision and the
+      // submitted avatar_memory differs from the stored one, the
+      // memory change is ignored (the stored, newer memory is kept)
+      // while every other field saves as usual — a form opened before
+      // a generation repair landed cannot roll the memory back.
+      // Callers that send no revision save exactly as before.
+      avatar_memory_revision: z.number().int().min(0).optional(),
     }),
     response: z.object({
       ok: z.literal(true),
@@ -3528,6 +4203,124 @@ export const Actions = {
       if (args.sync_to_chara_chat !== undefined) {
         merged.chara_chat_sync = args.sync_to_chara_chat;
       }
+      // F-3 (TC-N05): stale-form protection for avatar_memory. When
+      // the form's loaded revision is older than the stored one — a
+      // generation write-back (the CR-21 repair) changed the memory
+      // while the form was open — and the submitted memory differs
+      // from the stored one, the memory change is ignored and the
+      // stored memory is kept; every other field saves as usual. An
+      // intentional clear (allow_clear lists "avatar_memory", e.g.
+      // the 固有の記憶リセット） is an explicit user decision in THIS
+      // save, not a stale echo, so it still applies. Callers that
+      // send no revision are unaffected.
+      if (
+        args.avatar_memory_revision !== undefined &&
+        !args.allow_clear.includes("avatar_memory") &&
+        args.avatar_memory_revision < (before.avatar_memory_revision ?? 0) &&
+        merged.avatar_memory !== before.avatar_memory
+      ) {
+        merged.avatar_memory = before.avatar_memory;
+      }
+      // F-6 (TC-12/14/15a): deletion-record (tombstone) bookkeeping
+      // for this save. The merge above seeded merged.deletion_records
+      // from the stored records; now compare the pre-save profile
+      // (`before`) with the merged result:
+      // - an AUTO catchphrase item / flavor trait that existed before
+      //   and is gone after the merge is recorded as deleted, so later
+      //   generation write-backs cannot resurrect it through their
+      //   union merges; a generated EXAMPLE line is recorded the same
+      //   way regardless of its trait's source (auto or manual —
+      //   TC-15a retest: generated lines also live on manual traits);
+      // - content the user manually re-entered in this save (a manual
+      //   catchphrase containing the item, a manual trait with the
+      //   label, a manual example line) releases its record.
+      {
+        const records = {
+          catchphrases: [...(merged.deletion_records?.catchphrases ?? [])],
+          flavor_labels: [...(merged.deletion_records?.flavor_labels ?? [])],
+          flavor_examples: Object.fromEntries(
+            Object.entries(merged.deletion_records?.flavor_examples ?? {}).map(
+              ([label, lines]) => [label, [...lines]],
+            ),
+          ),
+        };
+        // Same item splitting as the write-back merge (both "／" and
+        // newlines), so deletion-record comparisons never depend on
+        // which separator form a value happens to be in.
+        const splitCatchphrases = splitCatchphraseItems;
+        // --- additions: auto content that disappeared in this save ---
+        if (before.speech.sources.catchphrase === "auto") {
+          const afterItems = new Set(
+            splitCatchphrases(merged.speech.structured.catchphrase),
+          );
+          for (const item of splitCatchphrases(
+            before.speech.structured.catchphrase,
+          )) {
+            if (!afterItems.has(item) && !records.catchphrases.includes(item))
+              records.catchphrases.push(item);
+          }
+        }
+        const afterTraitsByLabel = new Map(
+          merged.flavor.traits.map((t) => [t.label, t]),
+        );
+        for (const t of before.flavor.traits) {
+          const after = afterTraitsByLabel.get(t.label);
+          // The LABEL record stays auto-only: a manual trait is the
+          // user's own entry, and a write-back never resurrects manual
+          // traits anyway (manual labels win in applyAutoFlavorTraits).
+          if (
+            t.source === "auto" &&
+            !after &&
+            !records.flavor_labels.includes(t.label)
+          )
+            records.flavor_labels.push(t.label);
+          // F-6 follow-up (TC-15a retest): EXAMPLE records apply to
+          // traits of EITHER source. A generated example line can sit
+          // on a manual trait (the flavor_examples write-back stores
+          // lines without changing the trait's source), and deleting
+          // such a line in an edit save must tombstone it exactly like
+          // an auto trait's line — otherwise the trait looks empty,
+          // gets auto-re-queued, and the write-back resurrects the
+          // line the user just removed.
+          const afterExamples = new Set(after?.examples ?? []);
+          const missing = t.examples.filter((e) => !afterExamples.has(e));
+          if (missing.length > 0) {
+            const current = records.flavor_examples[t.label] ?? [];
+            records.flavor_examples[t.label] = [
+              ...new Set([...current, ...missing]),
+            ].slice(0, 10);
+          }
+        }
+        // --- releases: the same content manually re-entered ---
+        if (merged.speech.sources.catchphrase === "manual") {
+          const items = new Set(
+            splitCatchphrases(merged.speech.structured.catchphrase),
+          );
+          records.catchphrases = records.catchphrases.filter(
+            (c) => !items.has(c),
+          );
+        }
+        const manualTraitsByLabel = new Map(
+          merged.flavor.traits
+            .filter((t) => t.source === "manual")
+            .map((t) => [t.label, t]),
+        );
+        records.flavor_labels = records.flavor_labels.filter(
+          (l) => !manualTraitsByLabel.has(l),
+        );
+        for (const [label, lines] of Object.entries(records.flavor_examples)) {
+          const trait = manualTraitsByLabel.get(label);
+          if (!trait) continue;
+          const kept = lines.filter((e) => !trait.examples.includes(e));
+          if (kept.length > 0) records.flavor_examples[label] = kept;
+          else delete records.flavor_examples[label];
+        }
+        merged.deletion_records = {
+          catchphrases: records.catchphrases.slice(0, 50),
+          flavor_labels: records.flavor_labels.slice(0, 50),
+          flavor_examples: records.flavor_examples,
+        };
+      }
       // CR-17: drop transcript bookkeeping entries for video URLs that
       // are no longer on the profile — a removed video's failure record
       // or processed mark must not linger and mislead the detail screen.
@@ -3541,6 +4334,21 @@ export const Actions = {
             merged.background.unreadable_videos.filter(entryIsCurrent),
           video_processed_urls:
             merged.background.video_processed_urls.filter(entryIsCurrent),
+        };
+      }
+      // F-11 (TC-10): when a save leaves the profile with NO reference
+      // videos at all, the transcript findings go with them —
+      // video_notes and the attempted-URL record are cleared, matching
+      // the existing link behavior (removing every reference link
+      // clears the link_summary body). The merge above only reaches
+      // this state when the videos were actually removed (a payload
+      // that never carried them keeps the stored URLs, so their notes
+      // survive untouched).
+      if (normalizeVideoUrls(merged.background.video_urls).length === 0) {
+        merged.background = {
+          ...merged.background,
+          video_notes: null,
+          video_processed_urls: [],
         };
       }
       const normalizeLinks = (links: string[]) =>
@@ -3615,54 +4423,45 @@ export const Actions = {
           updatedAt: now,
         })
         .where(eq(schema.profiles.id, args.id));
+      // F-1 (TC-20): a still-pending trial_conversation request for
+      // this profile gets its tone material rebuilt from the profile
+      // as just saved, so the greeting is generated from the CURRENT
+      // tone instead of the queue-time one. Status untouched, no new
+      // request, processing requests stay frozen.
+      await refreshPendingTrialPayloads(ctx, args.id, clean);
+      // F-5 (TC-25b): saving with the chara-chat sync OFF cancels the
+      // profile's still-PENDING chara_chat_sync requests — an already
+      // queued reflection must not go through after the user turned
+      // sync off. A processing request is already being sent and is
+      // left alone.
+      if (args.sync_to_chara_chat === false) {
+        await db
+          .delete(schema.generationRequests)
+          .where(
+            and(
+              eq(schema.generationRequests.profileId, args.id),
+              eq(schema.generationRequests.kind, "chara_chat_sync"),
+              eq(schema.generationRequests.status, "pending"),
+            ),
+          );
+      }
       if (requeue) {
         // R-6: an already-open link_summary request is refreshed with
         // the new payload instead of duplicated (upsert).
+        // D-2 (M-2a): the payload is built by the shared
+        // buildLinkSummaryPayload — the links are the caller value,
+        // the CR-21 addendum-2 memory-repair fields ride along via
+        // opts when this re-queue is a portrayal_focus-removal repair
+        // (M-2b). Unifying the build adds user_relationship_note and
+        // background_user_relationship to this path's payload (an
+        // intended, recorded difference); every other key matches the
+        // previous inline build.
         await upsertOpenGenerationRequest(ctx, args.id, "link_summary", () =>
-          JSON.stringify({
-            links: newLinks,
-            // CR-07: 「私の扱い」 travels with generation requests so
-            // summaries/greetings reflect the specified relationship.
-            user_relationship: clean.background.user_relationship ?? null,
-            // CR-17: tone findings from the reference videos' dialogue,
-            // as reference material for summary/greeting generation.
-            video_notes: clean.background.video_notes ?? null,
-            background_video_notes: clean.background.video_notes ?? null,
-            video_notes_note:
-              "video_notes は参考動画の文字起こし（台詞）から読み取れた口調の特徴です。ある場合は、要約や口調の推定でその口癖・語尾・言い回しを参考資料の1つとして使ってください（推定の時点で動画の知見を統合してください）。null の場合は動画由来の材料はまだありません。",
-            // CR-19: only when 「演じる姿・状況」 is set — the summary
-            // is built from the matching parts of the links only.
-            ...portrayalGenerationFields(clean),
-            // CR-21 addendum 2: only when this re-queue is the repair
-            // re-queue of a portrayal_focus removal — the current
-            // avatar_memory plus the strip-the-specification repair
-            // instruction (empty object otherwise).
-            ...(portrayalCleared
-              ? portrayalMemoryRepairFields(clean)
-              : {}),
-            speech: mergedSpeechView(clean),
-            speech_structured: speechStructuredPayload(clean),
-            speech_sources: { ...clean.speech.sources },
-            manual_speech_fields: manualSpeechFields(clean),
-            // CR-20: the speech write-back follows the same merge rules
-            // as video_transcript (CR-18) — stated explicitly here.
-            speech_note: SPEECH_MERGE_NOTE,
-            speech_merge_note: SPEECH_MERGE_NOTE,
-            note: SPEECH_MERGE_NOTE,
-            // CR-08: flavor travels with generation requests so the
-            // chat side can infer flavor traits from the links and
-            // write them back as "auto" (manual traits are protected).
-            // CR-14: each trait carries frequency (null = follow global)
-            // and effective_frequency (frequency ?? level).
-            flavor: mergedFlavorView(clean),
-            flavor_level: clean.flavor.level,
-            flavor_traits: flavorTraitsPayload(clean),
-            manual_flavor_traits: manualFlavorTraitsPayload(clean),
-            flavor_note:
-              "フレーバー項目を背景リンクから推定できる場合は、書き戻し result の flavor_traits（または flavor.traits）に含めてください。各項目は {label, examples[], scenes[], enabled} の形です。" +
-              FLAVOR_MERGE_NOTE +
-              " CR-14: 各項目には frequency（項目ごとの頻度、null=全体に従う）と effective_frequency（実効頻度 = frequency ?? level）が付きます。実効頻度0の項目は出さないでください。",
-          }),
+          buildLinkSummaryPayload(
+            clean,
+            { links: newLinks },
+            { memoryRepair: portrayalCleared },
+          ),
         );
       }
       // CR-12: flavor traits with auto_examples on and no examples yet
@@ -3828,6 +4627,16 @@ export const Actions = {
         // of re-reading the row with getRow — the result is identical.
         await pregeneratePrimaryThumb(ctx, parseData(JSON.stringify(clean)));
       }
+      // D-1/D-3: the preparation guarantee runs LAST in the save —
+      // after the F-1 payload refresh, the portrayal/link re-queue
+      // and the video queueing above — so any item this save left
+      // pending without an open request (e.g. a greeting cleared in
+      // this save, or an item whose request was deleted earlier) gets
+      // exactly one request. Insert-only for requests; in the video
+      // paths it may still write the profile row (queueing via the
+      // video path, and recording a failure in the
+      // no-unprocessed-URLs branch), which can advance updatedAt.
+      await ensurePreparationRequests(ctx, args.id);
       ctx.invalidateQueries();
       return {
         ok: true,
@@ -3849,14 +4658,30 @@ export const Actions = {
   }),
 
   duplicateProfile: defineAction({
-    description: "Duplicates a profile under a new id (name gets a コピー suffix).",
+    description: "Duplicates a profile under a new id (name gets a コピー suffix). F-7: the copy does not inherit candidate_id (it starts null). F-13: the copy also does not inherit the chara-chat synced state (chara_chat_synced_at starts null — the copy itself has never been reflected); the edit form's duplicate path applies the same rule, so both duplication routes produce the same starting state. D-1: right after the insert, the preparation guarantee queues exactly one request for each preparation item the copy still has pending without an open request (link_summary / trial_conversation / video_transcript).",
     request: z.object({ id: z.string().min(1) }),
     response: z.object({ id: z.string() }),
     async handler(ctx, args) {
       const row = await getRow(ctx, args.id);
       const data = parseData(row.data);
       data.images = data.images.map((img) => ({ ...img }));
+      // F-7 (TC-N02): the copy does not inherit candidate_id — the
+      // candidate belongs to the original profile's apply flow, and a
+      // carried-over id would read as a valid candidate for an image
+      // this copy never generated.
+      data.candidate_id = null;
+      // F-13: the copy does not inherit the chara-chat synced state
+      // either — chara_chat_synced_at records when THIS profile was
+      // last reflected into the chara-chat app, and the copy has
+      // never been reflected. (The chara_chat_sync preference is a
+      // setting, not state, and is carried over as-is.)
+      data.chara_chat_synced_at = null;
       const id = await insertProfile(ctx, `${row.name} のコピー`, data);
+      // D-1/D-3: the copy inherits the source's preparation state but
+      // none of its requests — the guarantee queues whatever the copy
+      // still needs (link_summary / greeting / video) for the copy
+      // itself, right after the insert.
+      await ensurePreparationRequests(ctx, id);
       ctx.invalidateQueries();
       return { id };
     },
@@ -3880,7 +4705,7 @@ export const Actions = {
 
   deleteProfile: defineAction({
     description:
-      "Moves a profile to the trash (soft delete, restorable for 30 days). The default profile cannot be deleted.",
+      "Moves a profile to the trash (soft delete, restorable for 30 days). The default profile cannot be deleted. F-12: once 30 days have passed, the trashed profile is permanently deleted automatically (same procedure as purgeProfile) by the expiry sweep that runs on the main read paths.",
     request: z.object({ id: z.string().min(1) }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
@@ -3898,10 +4723,12 @@ export const Actions = {
   }),
 
   listTrash: defineAction({
-    description: "Lists profiles in the trash with their deletion dates.",
+    description: "Lists profiles in the trash with their deletion dates. F-12: entries past the 30-day retention are permanently deleted by the expiry sweep before the list is read, so the trash never shows copies whose restore deadline has already passed.",
     request: z.object({}),
     response: z.object({ profiles: z.array(profileOutSchema) }),
     async handler(ctx) {
+      // F-12: lazily purge trash entries past the 30-day retention.
+      await purgeExpiredTrash(ctx);
       const db = ctx.db<typeof schema>();
       const rows = await db
         .select()
@@ -3923,7 +4750,7 @@ export const Actions = {
   }),
 
   restoreProfile: defineAction({
-    description: "Restores a trashed profile back to the list.",
+    description: "Restores a trashed profile back to the list. D-1: at the end of the restore, the preparation guarantee re-queues exactly one request for any preparation item (link_summary / greeting / video) that is pending again without an open request.",
     request: z.object({ id: z.string().min(1) }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
@@ -3933,60 +4760,25 @@ export const Actions = {
         .update(schema.profiles)
         .set({ deletedAt: null, updatedAt: new Date() })
         .where(eq(schema.profiles.id, args.id));
+      // D-1/D-3: at the end of the restore — while the profile was in
+      // the trash its open requests were hidden (F-14) and could have
+      // been deleted; the guarantee re-queues any preparation item
+      // that is pending again without an open request.
+      await ensurePreparationRequests(ctx, args.id);
       ctx.invalidateQueries();
       return { ok: true };
     },
   }),
 
   purgeProfile: defineAction({
-    description: "Permanently deletes a trashed profile and its history. The profile's generation-request and switch-request rows are deleted with it, and its image blobs are deleted too — except any blob another profile still references (duplicated profiles share blobs); thumbnails under thumbs/ are content-addressed and shared, so they are never deleted here.",
+    description: "Permanently deletes a trashed profile and its history. The profile's generation-request and switch-request rows are deleted with it, and its image blobs are deleted too — except any blob another profile still references (duplicated profiles share blobs); thumbnails under thumbs/ are content-addressed and shared, so they are never deleted here. F-12: the deletion itself runs through the shared purgeTrashedProfileRow procedure, which the automatic 30-day trash expiry sweep also uses, so a manual purge and an expired purge remove exactly the same things.",
     request: z.object({ id: z.string().min(1) }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
-      const db = ctx.db<typeof schema>();
       const row = await getRow(ctx, args.id);
       if (!row.deletedAt)
         throw new Error("ゴミ箱に入っていないプロファイルは完全削除できません。");
-      // R-9: decide which of this profile's image blobs may go BEFORE
-      // the row disappears — a blob another profile still references
-      // (e.g. the original of a duplicate) must survive the purge.
-      // Thumbnails (thumbs/…) are not in the images list and are
-      // content-addressed/shared, so they are never deletion targets.
-      const data = parseData(row.data);
-      const blobKeys = [
-        ...new Set(
-          data.images
-            .map((i) => i.blob_key)
-            .filter((k): k is string => !!k),
-        ),
-      ];
-      const deletableKeys: string[] = [];
-      for (const key of blobKeys) {
-        if (!(await blobKeyReferencedByOtherProfile(ctx, key, args.id)))
-          deletableKeys.push(key);
-      }
-      await db
-        .delete(schema.profileHistory)
-        .where(eq(schema.profileHistory.profileId, args.id));
-      // R-7: the profile's queued request rows go with it — leaving
-      // them behind kept deleted profiles' requests in the database
-      // forever.
-      await db
-        .delete(schema.generationRequests)
-        .where(eq(schema.generationRequests.profileId, args.id));
-      await db
-        .delete(schema.switchRequests)
-        .where(eq(schema.switchRequests.profileId, args.id));
-      await db
-        .delete(schema.profiles)
-        .where(eq(schema.profiles.id, args.id));
-      for (const key of deletableKeys) {
-        try {
-          await ctx.blobs.delete(key);
-        } catch {
-          // Blob cleanup is best-effort.
-        }
-      }
+      await purgeTrashedProfileRow(ctx, row);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -3996,7 +4788,7 @@ export const Actions = {
 
   uploadImage: defineAction({
     description:
-      "Stores an uploaded image (PNG/JPG/WebP, up to about 10MB) as a blob and adds it to the profile's image list. CR-10: theme_color_candidate (the image's dominant color as a #rrggbb hex, extracted client-side) becomes the profile's theme color with source auto — unless the user set the theme color manually, in which case the manual color is kept. CR-28: image_base.image_ref follows the effective primary entry — the new upload only becomes the generation reference when it became primary.",
+      "Stores an uploaded image (PNG/JPG/WebP, up to about 10MB) as a blob and adds it to the profile's image list. CR-10: theme_color_candidate (the image's dominant color as a #rrggbb hex, extracted client-side) becomes the profile's theme color with source auto — unless the user set the theme color manually, in which case the manual color is kept. CR-28: image_base.image_ref follows the effective primary entry — the new upload only becomes the generation reference when it became primary. F-7: when the new upload becomes the representative image, candidate_id is cleared (it referred to the old representative).",
     request: z.object({
       profile_id: z.string().min(1),
       data_base64: z.string().min(1).max(14_000_000),
@@ -4022,6 +4814,11 @@ export const Actions = {
         { id: imageId, file: key, blob_key: key, source: "upload" },
         makePrimary,
       );
+      // F-7 (TC-N01): when the new image becomes the representative
+      // image, any stored candidate_id referred to the OLD
+      // representative — it is cleared so the chat side cannot treat
+      // a stale candidate as current.
+      if (makePrimary) data.candidate_id = null;
       data.image_base = { ...data.image_base, type: "image" };
       // CR-28: the generation reference follows the effective primary
       // entry — the new upload when it became primary, the existing
@@ -4049,7 +4846,7 @@ export const Actions = {
 
   addImageByUrl: defineAction({
     description:
-      "Registers an image URL as one of the profile's images. CR-10: theme_color_candidate (#rrggbb, extracted client-side when the image is readable) becomes the theme color with source auto, unless the theme color was set manually. CR-28: image_base.image_ref follows the effective primary entry — the added URL only becomes the generation reference when it became primary.",
+      "Registers an image URL as one of the profile's images. CR-10: theme_color_candidate (#rrggbb, extracted client-side when the image is readable) becomes the theme color with source auto, unless the theme color was set manually. CR-28: image_base.image_ref follows the effective primary entry — the added URL only becomes the generation reference when it became primary. F-7: when the added image becomes the representative image, candidate_id is cleared.",
     request: z.object({
       profile_id: z.string().min(1),
       url: z.string().url().max(2000),
@@ -4069,6 +4866,9 @@ export const Actions = {
         { id: imageId, file: args.url, blob_key: null, source: "url" },
         makePrimary,
       );
+      // F-7 (TC-N01): same rule as uploadImage — a new representative
+      // image invalidates the stored candidate_id.
+      if (makePrimary) data.candidate_id = null;
       data.image_base = { ...data.image_base, type: "image" };
       // CR-28: same rule as uploadImage — image_ref follows the
       // effective primary entry, not unconditionally the added URL.
@@ -4093,7 +4893,7 @@ export const Actions = {
 
   setPrimaryImage: defineAction({
     description:
-      "Makes one of the profile's images the primary image. CR-10: theme_color_candidate (#rrggbb for the new primary image) re-acquires the theme color as auto, unless it was set manually. CR-28: the generation reference (image_base.image_ref) moves to the designated image as well.",
+      "Makes one of the profile's images the primary image. CR-10: theme_color_candidate (#rrggbb for the new primary image) re-acquires the theme color as auto, unless it was set manually. CR-28: the generation reference (image_base.image_ref) moves to the designated image as well. F-7: when the representative image actually changes, candidate_id is cleared.",
     request: z.object({
       profile_id: z.string().min(1),
       image_id: z.string().min(1),
@@ -4107,10 +4907,16 @@ export const Actions = {
       const data = parseData(row.data);
       if (!data.images.some((i) => i.id === args.image_id))
         throw new Error("画像が見つかりません。");
+      // F-7 (TC-N01): changing WHICH image is the representative
+      // invalidates the stored candidate_id (it referred to the old
+      // representative). Re-designating the same image changes
+      // nothing and keeps it.
+      const previousPrimaryId = findPrimaryImageEntry(data)?.id ?? null;
       data.images = data.images.map((img) => ({
         ...img,
         is_primary: img.id === args.image_id,
       }));
+      if (previousPrimaryId !== args.image_id) data.candidate_id = null;
       // CR-28: designating a new primary also moves the generation
       // reference (image_base.image_ref) to that image — previously the
       // ref kept pointing at the previous base image.
@@ -4128,7 +4934,7 @@ export const Actions = {
   }),
 
   removeImage: defineAction({
-    description: "Removes one image from a profile (older images stay until removed). The image's blob is deleted only when no other profile references the same blob key — duplicated profiles share blobs, so a still-referenced blob is kept. CR-28: the generation reference (image_base.image_ref) follows the removal — it re-points at the new effective primary when images remain, and is cleared when the removed image was the last one and the ref pointed at it, so a deleted image can never remain the generation reference (or be resurrected from the dangling ref).",
+    description: "Removes one image from a profile (older images stay until removed). The image's blob is deleted only when no other profile references the same blob key — duplicated profiles share blobs, so a still-referenced blob is kept. CR-28: the generation reference (image_base.image_ref) follows the removal — it re-points at the new effective primary when images remain, and is cleared when the removed image was the last one and the ref pointed at it, so a deleted image can never remain the generation reference (or be resurrected from the dangling ref). F-7: removing the representative image also clears candidate_id.",
     request: z.object({
       profile_id: z.string().min(1),
       image_id: z.string().min(1),
@@ -4139,7 +4945,14 @@ export const Actions = {
       const row = await getRow(ctx, args.profile_id);
       const data = parseData(row.data);
       const target = data.images.find((i) => i.id === args.image_id);
+      // F-7 (TC-N01): removing the representative image invalidates
+      // the stored candidate_id (it referred to that image). Removing
+      // any other image leaves the representative — and the
+      // candidate — untouched.
+      const removedWasPrimary =
+        !!target && findPrimaryImageEntry(data)?.id === target.id;
       data.images = data.images.filter((i) => i.id !== args.image_id);
+      if (removedWasPrimary) data.candidate_id = null;
       if (target?.is_primary && data.images[0]) data.images[0].is_primary = true;
       // CR-28: the generation reference (image_base.image_ref) follows
       // the images list. When images remain it re-points at the new
@@ -4236,7 +5049,7 @@ export const Actions = {
 
   restoreHistory: defineAction({
     description:
-      "Restores a profile to a saved version; the current state is itself saved to history first.",
+      "Restores a profile to a saved version; the current state is itself saved to history first. F-9: a restored image entry whose blob_key survives but whose blob was deleted afterwards reads back with a serving URL re-attached from its surviving thumbnail (content-addressed, never deleted with the original) — the same read-side repair is applied when assembling switch / generation reference payloads, so a restored entry never reaches the chat side with url: null while a copy of the image still exists.",
     request: z.object({
       profile_id: z.string().min(1),
       history_id: z.number().int().positive(),
@@ -4278,6 +5091,11 @@ export const Actions = {
           updatedAt: new Date(),
         })
         .where(eq(schema.profiles.id, args.profile_id));
+      // CR-RL-02: a restore can bring back pending preparation items
+      // whose requests are long gone — run the same guarantee as the
+      // other write paths so every pending item has an open request
+      // behind it (trashed profiles are skipped inside the helper).
+      await ensurePreparationRequests(ctx, args.profile_id);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -4325,7 +5143,7 @@ export const Actions = {
 
   listPendingSwitchRequests: defineAction({
     description:
-      "Lists switch requests still waiting for the chat-side agent (pending or processing), oldest first.",
+      "Lists switch requests still waiting for the chat-side agent (pending or processing), oldest first. F-8: requests whose target profile is in the trash (deleted_at set) are NOT listed — the request rows are kept untouched and reappear when the profile is restored.",
     request: z.object({}),
     response: z.object({ requests: z.array(switchRequestOut) }),
     async handler(ctx) {
@@ -4335,7 +5153,28 @@ export const Actions = {
         .from(schema.switchRequests)
         .orderBy(schema.switchRequests.createdAt);
       const open = rows.filter((r) => isOpenStatus(r.status));
-      const requests = await toSwitchOutMany(ctx, open);
+      // F-8 (TC-N15): a switch request whose target profile is in
+      // the trash is NOT listed — from the chat side it must not look
+      // processable while the profile is deleted. The request row
+      // itself is kept untouched, so restoring the profile makes it
+      // reappear exactly as it was. (F-14 later applied the same
+      // rule to open generation requests in listGenerationRequests.)
+      let visible = open;
+      if (open.length > 0) {
+        const ids = [...new Set(open.map((r) => r.profileId))];
+        const profs = await db
+          .select({
+            id: schema.profiles.id,
+            deletedAt: schema.profiles.deletedAt,
+          })
+          .from(schema.profiles)
+          .where(inArray(schema.profiles.id, ids));
+        const trashed = new Set(
+          profs.filter((p) => p.deletedAt).map((p) => p.id),
+        );
+        visible = open.filter((r) => !trashed.has(r.profileId));
+      }
+      const requests = await toSwitchOutMany(ctx, visible);
       return { requests };
     },
   }),
@@ -4466,7 +5305,7 @@ export const Actions = {
 
   createGenerationRequest: defineAction({
     description:
-      "Queues a request for the chat-side agent: image_generation, link_summary, trial_conversation, profile_apply (CR-03: apply an edit to the active avatar right away; normally created by updateProfile with apply_now=true), or flavor_examples (CR-12: invent example lines for flavor traits whose auto_examples flag is on and whose examples are empty — normally queued automatically by createProfile/updateProfile; when created through this action for a profile, the payload is rebuilt server-side from the profile's current targets and context, and an already-open flavor_examples request for that profile is refreshed instead of duplicated). Payload is a JSON string describing what to generate. For profile_apply the response also carries the canned phrase (CR-04) to paste into chat as the trigger. CR-06: link_summary / trial_conversation payloads are enriched server-side with the profile's merged speech fields (speech / speech_structured), their sources (speech_sources), and manual_speech_fields — infer the non-manual speech fields from the background links/name and return them in the write-back result. CR-07: those payloads also carry user_relationship (「私の扱い」) with a note to follow it in greeting/tone generation when set; it is the user's own specification and must never be changed by a write-back. CR-08: those payloads also carry the flavor setting (flavor: level + enabled traits; flavor_traits: all stored traits; manual_flavor_traits: the protected manual ones) — infer flavor traits from the background links/name and return them in the write-back result as flavor_traits [{label, examples[], scenes[], enabled}]; never change manual traits or the level. video_transcript (CR-17: fetch the transcripts of the profile's 参考動画URL and mine the dialogue for tone — normally queued automatically by createProfile/updateProfile when an unprocessed video URL exists; when created through this action the payload is rebuilt server-side from the profile's current video URLs and context with force, and an already-open video_transcript request is refreshed instead of duplicated). CR-23: a YouTube playlist URL (youtube.com/playlist?list=…) among the video URLs is flagged in the payload as playlist_urls with a playlist_note — the chat side expands the list and fetches the transcript of every video in it, mining the whole list's dialogue together into one video_notes; per-video failures are reported in unreadable_videos as 「{playlist URL} 内の {video URL}（reason）」 so they stay tied to the playlist entry, and the playlist URL itself is marked attempted like any other video URL. CR-17: link_summary / trial_conversation payloads also carry video_notes (background.video_notes — tone findings from the reference videos' dialogue) as tone reference material. CR-19: when the profile's 「演じる姿・状況」 (background.portrayal_focus) is set, payloads additionally carry portrayal_focus + portrayal_focus_note — for link_summary / flavor_examples / video_transcript / image_generation, use ONLY the source material matching that portrayal/situation (for videos, the matching chapters/segments) and report back (portrayal_focus_no_match) instead of filling from other periods/states when nothing matches; for trial_conversation, respond in that portrayal/situation. When portrayal_focus is empty, no portrayal keys are added at all. CR-20: link_summary payloads state the unified speech/flavor merge rules in their notes (speech_note / speech_merge_note / note, flavor_note) — speech write-backs merge like CR-18 video write-backs (catchphrase union, first/second person fill-only, memo/style as integrated text) and flavor write-backs merge into existing auto traits instead of replacing them; video_transcript payloads carry the current flavor (flavor / flavor_traits with auto/manual distinction, manual_flavor_traits, flavor_note) and their results may carry flavor_traits. CR-21: the portrayal notes (portrayal_focus_note) now state the fall-back contract — when no source material matches the specified portrayal/situation, ignore the bias and build the summary/tone from ALL material as usual (never replace the summary or notes with a 'no material' text), and report the miss in the result as portrayal_focus_no_match: true with portrayal_focus_no_match_reason (a reason sentence). While a profile's portrayal check state is failed, its bias is inactive and NO portrayal keys are added to any payload (generation, trial, image) — the payload is exactly the one an unused-field profile gets. CR-22: trial_conversation payloads (acting) are enriched server-side with address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方) — for every profile regardless of its call_user_as / second_person settings, and a profile_apply payload created through this action gains it too; the generation kinds (link_summary / video_transcript / flavor_examples / image_generation) never carry it. CR-24: kind chara_chat_sync reflects one profile into the chara-chat app — normally queued automatically by createProfile/updateProfile when the form's 「キャラチャットに反映する」 checkbox is on; when created through this action the target is re-discovered server-side under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus), the payload is rebuilt with the discovered target slug, an already-open request for the profile is refreshed instead of duplicated, and the mediator is kicked; it errors when no receiver exists in this environment. For link_summary / trial_conversation, an already-open request of the same kind for the profile is likewise refreshed with the new payload instead of duplicated (image_generation / profile_apply always create a fresh request). CR-28: profile_apply and image_generation payloads for a profile are enriched server-side with reference_image — the generation reference resolved from the profile's current primary image (uploads carry an openable url alongside the internal blob_key) — and reference_image_note (never substitute another image found in the profile; fail the write-back when the reference cannot be obtained); a profile_apply payload's image_ref is replaced by the resolved reference value when one exists.",
+      "Queues a request for the chat-side agent: image_generation, link_summary, trial_conversation, profile_apply (CR-03: apply an edit to the active avatar right away; normally created by updateProfile with apply_now=true), or flavor_examples (CR-12: invent example lines for flavor traits whose auto_examples flag is on and whose examples are empty — normally queued automatically by createProfile/updateProfile; when created through this action for a profile, the payload is rebuilt server-side from the profile's current targets and context, and an already-open flavor_examples request for that profile is refreshed instead of duplicated). Payload is a JSON string describing what to generate. For profile_apply the response also carries the canned phrase (CR-04) to paste into chat as the trigger. CR-06: link_summary / trial_conversation payloads are enriched server-side with the profile's merged speech fields (speech / speech_structured), their sources (speech_sources), and manual_speech_fields — infer the non-manual speech fields from the background links/name and return them in the write-back result. CR-07: those payloads also carry user_relationship (「私の扱い」) with a note to follow it in greeting/tone generation when set; it is the user's own specification and must never be changed by a write-back. CR-08: those payloads also carry the flavor setting (flavor: level + enabled traits; flavor_traits: all stored traits; manual_flavor_traits: the protected manual ones) — infer flavor traits from the background links/name and return them in the write-back result as flavor_traits [{label, examples[], scenes[], enabled}]; never change manual traits or the level. video_transcript (CR-17: fetch the transcripts of the profile's 参考動画URL and mine the dialogue for tone — normally queued automatically by createProfile/updateProfile when an unprocessed video URL exists; when created through this action the payload is rebuilt server-side from the profile's current video URLs and context with force, and an already-open video_transcript request is refreshed instead of duplicated). CR-23: a YouTube playlist URL (youtube.com/playlist?list=…) among the video URLs is flagged in the payload as playlist_urls with a playlist_note — the chat side expands the list and fetches the transcript of every video in it, mining the whole list's dialogue together into one video_notes; per-video failures are reported in unreadable_videos as 「{playlist URL} 内の {video URL}（reason）」 so they stay tied to the playlist entry, and the playlist URL itself is marked attempted like any other video URL. CR-17: link_summary / trial_conversation payloads also carry video_notes (background.video_notes — tone findings from the reference videos' dialogue) as tone reference material. CR-19: when the profile's 「演じる姿・状況」 (background.portrayal_focus) is set, payloads additionally carry portrayal_focus + portrayal_focus_note — for link_summary / flavor_examples / video_transcript / image_generation, use ONLY the source material matching that portrayal/situation (for videos, the matching chapters/segments) and report back (portrayal_focus_no_match) instead of filling from other periods/states when nothing matches; for trial_conversation, respond in that portrayal/situation. When portrayal_focus is empty, no portrayal keys are added at all. CR-20: link_summary payloads state the unified speech/flavor merge rules in their notes (speech_note / speech_merge_note / note, flavor_note) — speech write-backs merge like CR-18 video write-backs (catchphrase union, first/second person fill-only, memo/style as integrated text) and flavor write-backs merge into existing auto traits instead of replacing them; video_transcript payloads carry the current flavor (flavor / flavor_traits with auto/manual distinction, manual_flavor_traits, flavor_note) and their results may carry flavor_traits. CR-21: the portrayal notes (portrayal_focus_note) now state the fall-back contract — when no source material matches the specified portrayal/situation, ignore the bias and build the summary/tone from ALL material as usual (never replace the summary or notes with a 'no material' text), and report the miss in the result as portrayal_focus_no_match: true with portrayal_focus_no_match_reason (a reason sentence). While a profile's portrayal check state is failed, its bias is inactive and NO portrayal keys are added to any payload (generation, trial, image) — the payload is exactly the one an unused-field profile gets. CR-22: trial_conversation payloads (acting) are enriched server-side with address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方) — for every profile regardless of its call_user_as / second_person settings, and a profile_apply payload created through this action gains it too; the generation kinds (link_summary / video_transcript / flavor_examples / image_generation) never carry it. CR-24: kind chara_chat_sync reflects one profile into the chara-chat app — normally queued automatically by createProfile/updateProfile when the form's 「キャラチャットに反映する」 checkbox is on; when created through this action the target is re-discovered server-side under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus), the payload is rebuilt with the discovered target slug, an already-open request for the profile is refreshed instead of duplicated, and the mediator is kicked; it errors when no receiver exists in this environment. For link_summary / trial_conversation, an already-open request of the same kind for the profile is likewise refreshed with the new payload instead of duplicated (image_generation / profile_apply always create a fresh request). CR-28: profile_apply and image_generation payloads for a profile are enriched server-side with reference_image — the generation reference resolved from the profile's current primary image (uploads carry an openable url alongside the internal blob_key) — and reference_image_note (never substitute another image found in the profile; fail the write-back when the reference cannot be obtained); a profile_apply payload's image_ref is replaced by the resolved reference value when one exists. F-4: trial_conversation payloads are enriched with base_greeting — the profile's greeting at queue time; the write-back compares it against the current greeting and never overwrites a greeting the user edited in the meantime (refreshing an already-pending request keeps its original base_greeting). F-10: link_summary / trial_conversation payloads also carry structured_priority_note — when the structured speech fields and the free-text tone memo disagree, the structured fields win. CR-29: link_summary payloads are enriched server-side with the standard two-stage fetch instruction (fetch_policy: two_stage_text_then_browser, link_fetch_note / fetch_fallback_note, and the same text inside note) — stage 1 is the existing text fetch and stage 2 is a real browser for any URL stage 1 could not read (network/DNS/connection failure, HTTP error, empty or JS-gated body); a URL may be returned in unreadable_links only after BOTH stages failed, with both stages' failure details in the recorded reason. Trial_conversation payloads carry the same fetch fields (their greeting/tone inference reads the same background links), link_summary requests without a profile carry them too, and video_transcript payloads carry the transcript variant (fetch_fallback_note / video_fetch_note) with the same both-stages rule for unreadable_videos. This applies to every profile as the standard read, not to any single profile.",
     request: z.object({
       profile_id: z.string().min(1).nullable().default(null),
       kind: z.enum([
@@ -4564,74 +5403,48 @@ export const Actions = {
         // without touching manual ones.
         if (args.kind === "link_summary" || args.kind === "trial_conversation") {
           const data = parseData(row.data);
-          const obj: Record<string, unknown> = parsePayloadObject(
-            args.payload,
-          );
-          obj.speech = mergedSpeechView(data);
-          obj.speech_structured = speechStructuredPayload(data);
-          obj.speech_sources = { ...data.speech.sources };
-          obj.manual_speech_fields = manualSpeechFields(data);
-          // CR-07: 「私の扱い」 — the relationship specification the
-          // greeting / summary generation must follow when present.
-          obj.user_relationship = data.background.user_relationship ?? null;
-          obj.background_user_relationship =
-            data.background.user_relationship ?? null;
-          obj.user_relationship_note =
-            "user_relationship は「私の扱い」（このキャラクターから見てユーザーがどういう存在か）の指定です。指定がある場合は、挨拶文や口調の生成でその関係性（主従・対等などの距離感や態度）に倣ってください。null（未指定）の場合は、背景や呼び方から自然に推定される扱いのままで構いません。この項目自体はユーザーの指定であり、書き戻しで変更しないでください。";
-          // CR-17: tone findings from the reference videos' dialogue
-          // travel as reference material, above all for trial
-          // conversations (greetings must sound like the videos' lines).
-          obj.video_notes = data.background.video_notes ?? null;
-          obj.background_video_notes = data.background.video_notes ?? null;
-          obj.video_notes_note =
-            "video_notes は参考動画の文字起こし（台詞）から読み取れた口調の特徴です。ある場合は、挨拶文や口調の生成でその口癖・語尾・言い回しを参考にしてください。null の場合は動画由来の材料はまだありません。";
-          obj.speech_note =
-            "口調の構造化欄です。manual_speech_fields に挙がった欄はユーザーの手動指定なので書き戻しで変更しないでください。それ以外の欄は背景URLや名前から推定して、書き戻し result の speech（または first_person 等のキー）に含めてください。" +
-            SPEECH_MERGE_NOTE;
-          // CR-20: the merge rules are also stated under explicit keys
-          // (and as the payload note for link_summary) so the chat side
-          // cannot miss them.
-          obj.speech_merge_note = SPEECH_MERGE_NOTE;
-          if (args.kind === "link_summary") obj.note = SPEECH_MERGE_NOTE;
-          // CR-08: flavor — the merged view (level + enabled traits),
-          // the full stored trait list, and the manual traits the
-          // write-back must never change or remove. The chat side
-          // infers this character's flavor traits from the background
-          // links/name and returns them in the result as flavor_traits
-          // (or flavor.traits): [{label, examples[], scenes[],
-          // enabled}]. The level is the user's bar setting; never
-          // change it in a write-back.
-          obj.flavor = mergedFlavorView(data);
-          obj.flavor_level = (data.flavor ?? emptyFlavor).level;
-          obj.flavor_traits = flavorTraitsPayload(data);
-          obj.manual_flavor_traits = manualFlavorTraitsPayload(data);
-          obj.flavor_note =
-            "フレーバー項目（キャラクターらしさ）です。背景URLや名前から推定できる項目は、書き戻し result の flavor_traits（または flavor.traits）に {label, examples[], scenes[], enabled} の形で含めてください。" +
-            FLAVOR_MERGE_NOTE +
-            " CR-14: 各項目の frequency（null=全体に従う）から決まる effective_frequency がその項目の実効頻度です。実効0の項目は出さないでください。";
-          // CR-19: 「演じる姿・状況」 — ONLY when set. link_summary is
-          // material-based generation (use only the matching parts of
-          // the sources); trial_conversation is acting (respond in
-          // that portrayal/situation). When unset, no portrayal keys
-          // are added and the payload is exactly as before.
-          // CR-21: while the bias is failed it is inactive — no
-          // portrayal keys either (portrayalEffectiveValue is null).
-          Object.assign(
-            obj,
-            portrayalFields(
-              data,
-              args.kind === "trial_conversation"
-                ? portrayalActingNote
-                : portrayalGenerationNote,
-            ),
-          );
-          // CR-22: trial_conversation is an acting kind, so its
-          // payload always carries the standing address note.
-          // link_summary is generation and must NOT carry it.
-          if (args.kind === "trial_conversation") {
-            obj.address_note = ADDRESS_NOTE;
+          // D-2: payload assembly lives in the shared builders — the
+          // caller's payload supplies the caller-priority keys
+          // (links / name / speech_style / tuning / call_user_as /
+          // background / note) and every server-owned key (tone
+          // material CR-06/07/08/17, merge-rule notes CR-20, the
+          // CR-29 fetch instruction, CR-19 portrayal fields, F-10) is
+          // (re)built from the profile's current state there. The
+          // final payload is unchanged from the previous inline build.
+          const callerValues = parsePayloadObject(args.payload);
+          if (args.kind === "link_summary") {
+            payload = buildLinkSummaryPayload(data, callerValues);
+          } else {
+            // F-4 (TC-19): pin the greeting as it stands at queue
+            // time. The write-back compares the profile's current
+            // greeting against base_greeting: if the user edited the
+            // greeting while the request was in flight, the generated
+            // text must not overwrite their edit. When this call
+            // refreshes an already-pending request (the upsert below),
+            // the ORIGINAL base_greeting is kept — re-queueing does
+            // not re-pin it, or the protection would dissolve.
+            let baseGreeting = data.greeting;
+            const openTrial = await db
+              .select()
+              .from(schema.generationRequests)
+              .where(
+                and(
+                  eq(schema.generationRequests.profileId, args.profile_id),
+                  eq(schema.generationRequests.kind, "trial_conversation"),
+                  eq(schema.generationRequests.status, "pending"),
+                ),
+              );
+            for (const r of openTrial) {
+              const prev = parsePayloadObject(r.payload);
+              if (typeof prev.base_greeting === "string") {
+                baseGreeting = prev.base_greeting;
+                break;
+              }
+            }
+            payload = buildTrialPayload(data, callerValues, {
+              baseGreeting,
+            });
           }
-          payload = JSON.stringify(obj);
         }
         // CR-22: a profile_apply request created directly through
         // this action also always carries the standing address note
@@ -4685,6 +5498,21 @@ export const Actions = {
           }
           if (touched) payload = JSON.stringify(obj);
         }
+      }
+      // CR-29: a link_summary request without a profile (no enrichment
+      // above) still carries the standard two-stage fetch instruction —
+      // the fallback is a property of the kind, not of one profile.
+      if (args.kind === "link_summary" && !payload.includes("link_fetch_note")) {
+        const obj: Record<string, unknown> = parsePayloadObject(payload);
+        obj.fetch_policy = "two_stage_text_then_browser";
+        obj.link_fetch_note = LINK_FETCH_FALLBACK_NOTE;
+        obj.fetch_fallback_note = LINK_FETCH_FALLBACK_NOTE;
+        if (typeof obj.note !== "string" || !obj.note.includes("二段階"))
+          obj.note =
+            (typeof obj.note === "string" && obj.note
+              ? obj.note + " "
+              : "") + LINK_FETCH_FALLBACK_NOTE;
+        payload = JSON.stringify(obj);
       }
       const now = new Date();
       // R-6: link_summary / trial_conversation go through the upsert —
@@ -4744,7 +5572,7 @@ export const Actions = {
 
   listGenerationRequests: defineAction({
     description:
-      "Lists generation requests, optionally only open ones or only those for one profile, newest first.",
+      "Lists generation requests, optionally only open ones or only those for one profile, newest first. F-2: a profile_apply request's payload is returned with reference_image / image_ref resolved at READ time from the profile's current primary image (the same resolution switch requests use) — every other payload field stays frozen at creation, and the stored payload is never rewritten. F-14: OPEN requests (pending or processing) whose target profile is in the trash are NOT listed — the same rule F-8 applies to switch requests — so a trashed profile's queued work never looks processable; the request rows are kept untouched and reappear when the profile is restored, and closed (completed / failed) requests stay listed as history.",
     request: z.object({
       only_open: z.boolean().default(false),
       profile_id: z.string().min(1).nullable().default(null),
@@ -4762,6 +5590,41 @@ export const Actions = {
         rows = rows.filter((r) => r.profileId === args.profile_id);
       if (args.only_open)
         rows = rows.filter((r) => isOpenStatus(r.status));
+      // F-14: an OPEN generation request whose target profile is in
+      // the trash is NOT listed as a processing target — from the
+      // chat side it must not look processable while the profile is
+      // deleted (the F-8 rule for switch requests, applied here).
+      // The request row itself is kept untouched, so restoring the
+      // profile makes it reappear exactly as it was; closed requests
+      // are history and stay listed.
+      const openProfileIds = [
+        ...new Set(
+          rows
+            .filter((r) => isOpenStatus(r.status) && r.profileId)
+            .map((r) => r.profileId as string),
+        ),
+      ];
+      if (openProfileIds.length > 0) {
+        const profs = await db
+          .select({
+            id: schema.profiles.id,
+            deletedAt: schema.profiles.deletedAt,
+          })
+          .from(schema.profiles)
+          .where(inArray(schema.profiles.id, openProfileIds));
+        const trashed = new Set(
+          profs.filter((p) => p.deletedAt).map((p) => p.id),
+        );
+        if (trashed.size > 0)
+          rows = rows.filter(
+            (r) =>
+              !(
+                isOpenStatus(r.status) &&
+                r.profileId &&
+                trashed.has(r.profileId)
+              ),
+          );
+      }
       rows = rows.slice(0, args.limit);
       const requests = await toGenOutMany(ctx, rows);
       return { requests };
@@ -4770,7 +5633,7 @@ export const Actions = {
 
   completeGenerationRequest: defineAction({
     description:
-      "Writes back a generation request result, field-scoped to the request kind (other profile fields and edits made in the meantime are preserved, D-02/R-12). For link_summary, result JSON {summary, unreadable_links} is applied; for image_generation, result JSON {file, blob_key, source} is appended to the images; for trial_conversation the greeting text is stored. CR-06: link_summary / trial_conversation results may also carry structured speech fields — flat keys (first_person, second_person, call_user_as, catchphrase, memo, style) or a nested speech/speech_structured object — which are stored as auto-generated values; fields the user set manually (speech.sources = manual) are never overwritten. CR-08: those results may also carry flavor traits (flavor_traits, flavor.traits, or traits: [{label, examples[], scenes[], enabled}]). CR-20: flavor write-backs MERGE into the existing auto traits instead of replacing them — a trait whose label matches an existing auto trait is updated on top of it (examples union-merged; scenes/enabled/frequency keep the stored values), a new label is added as a new auto trait, and auto traits absent from the write-back are kept; manual flavor traits are kept exactly and the flavor level never changes. For profile_apply (CR-03), result JSON may carry only {candidate_id, image_ref} (image_ref also accepted as image_base.image_ref) — those two fields alone are written back and everything else is preserved; a failed profile_apply touches no profile field. CR-12: for flavor_examples, the result carries example lines per trait — {examples_by_trait: {<trait id>: [lines]}} (flavor_examples in the same shape, or a traits-style array, are also accepted) — and each line set is stored on its trait ONLY if that trait still has no examples (examples the user typed in the meantime win and are never overwritten); a failed flavor_examples touches no profile field and no preparation item. A link_summary / trial_conversation write-back that creates auto flavor traits with auto_examples on and no examples queues a flavor_examples request for them. On failed (other kinds), only that kind's preparation item flips to failed and the reason is stored on the profile (preparation_errors) so the UI can show it with a retry path (D-03). CR-17: for video_transcript, the result is {video_notes, catchphrases[], unreadable_videos[]} — video_notes is stored on background.video_notes, catchphrases and any other speech fields in the result are applied as auto tone material (manual speech fields are never overwritten, CR-06 rule), unreadable_videos are recorded on the profile, and every current video URL is marked attempted (video_processed_urls). CR-20: link_summary / trial_conversation speech write-backs follow the same merge rules as video_transcript (see CR-18 below), and video_transcript results may also carry flavor_traits, applied with the CR-20 flavor merge. CR-18: video_transcript speech write-backs MERGE with existing auto fields instead of replacing them — catchphrase is union-merged (stored items kept, new candidates appended, deduplicated, joined with '／'), first_person / second_person are filled only when currently unset (an existing value is never overwritten), and memo / style in the result are treated as text already integrated with the existing tone (the request payload's note instructs the chat side to return them that way) and applied to the auto field as returned. A completed batch where every video was unreadable and no notes were produced flips the video preparation item to failed with the unreadable list as the reason; a failed video_transcript flips only the video item to failed with the reason — in both cases the profile itself and all other fields stay untouched and the profile remains usable. Write-backs for trashed profiles are recorded on the request only. CR-21: completed link_summary / video_transcript write-backs also record a portrayal verdict against the profile's current portrayal_focus (background.portrayal_focus_checks): result portrayal_focus_no_match: true (with portrayal_focus_no_match_reason) records a no_match for that kind; otherwise a completed link_summary records a match, and a video_transcript records a match when it produced video_notes (an all-unreadable batch with no notes records nothing unless the flag is present). The derived background.portrayal_focus_status is ok when any recorded check matched, failed when at least one check completed and all recorded checks are no_match (the latest reason is kept in portrayal_focus_failure_reason), and unknown otherwise. The verdict never alters content: a no-match write-back's summary/video_notes are stored exactly as returned (under the CR-21 contract they are built from all material), and the preparation state is untouched — a failed bias does not make the profile 要対応 and it stays ready/usable. While failed, the bias is inactive for switch output and every payload until a later check records a match. CR-21 addendum guard: when a result carries portrayal_focus_no_match, a summary / video_notes field that is missing — or that is just the bare 'no matching material' notice sentence — never overwrites the stored link_summary / video_notes; the stored full content is kept (only the verdict is recorded). CR-21 addendum 2: for link_summary / video_transcript requests whose payload carries the avatar_memory_repair marker (queued by updateProfile when portrayal_focus was removed), a completed result that returns a non-empty avatar_memory replaces the stored avatar_memory (the repaired text: specification-derived elements removed, other facts kept); a result without avatar_memory — or with an empty one — leaves the stored memory exactly as it was, and write-backs of non-repair requests never touch avatar_memory at all. CR-24: for chara_chat_sync, a completed write-back only stamps the profile's chara_chat_synced_at (the import itself happened in the target app); a failed one touches no profile field and no preparation item. A write-back for a request that is already completed or failed changes nothing and simply returns ok (idempotent).",
+      "Writes back a generation request result, field-scoped to the request kind (other profile fields and edits made in the meantime are preserved, D-02/R-12). For link_summary, result JSON {summary, unreadable_links} is applied; for image_generation, result JSON {file, blob_key, source} is appended to the images; for trial_conversation the greeting text is stored. CR-06: link_summary / trial_conversation results may also carry structured speech fields — flat keys (first_person, second_person, call_user_as, catchphrase, memo, style) or a nested speech/speech_structured object — which are stored as auto-generated values; fields the user set manually (speech.sources = manual) are never overwritten. CR-08: those results may also carry flavor traits (flavor_traits, flavor.traits, or traits: [{label, examples[], scenes[], enabled}]). CR-20: flavor write-backs MERGE into the existing auto traits instead of replacing them — a trait whose label matches an existing auto trait is updated on top of it (examples union-merged; scenes/enabled/frequency keep the stored values), a new label is added as a new auto trait, and auto traits absent from the write-back are kept; manual flavor traits are kept exactly and the flavor level never changes. For profile_apply (CR-03), result JSON may carry only {candidate_id, image_ref} (image_ref also accepted as image_base.image_ref) — those two fields alone are written back and everything else is preserved; a failed profile_apply touches no profile field. CR-12: for flavor_examples, the result carries example lines per trait — {examples_by_trait: {<trait id>: [lines]}} (flavor_examples in the same shape, or a traits-style array, are also accepted) — and each line set is stored on its trait ONLY if that trait still has no examples (examples the user typed in the meantime win and are never overwritten); a failed flavor_examples touches no profile field and no preparation item. A link_summary / trial_conversation write-back that creates auto flavor traits with auto_examples on and no examples queues a flavor_examples request for them. On failed (other kinds), only that kind's preparation item flips to failed and the reason is stored on the profile (preparation_errors) so the UI can show it with a retry path (D-03). CR-17: for video_transcript, the result is {video_notes, catchphrases[], unreadable_videos[]} — video_notes is stored on background.video_notes, catchphrases and any other speech fields in the result are applied as auto tone material (manual speech fields are never overwritten, CR-06 rule), unreadable_videos are recorded on the profile, and every current video URL is marked attempted (video_processed_urls). CR-20: link_summary / trial_conversation speech write-backs follow the same merge rules as video_transcript (see CR-18 below), and video_transcript results may also carry flavor_traits, applied with the CR-20 flavor merge. CR-18: video_transcript speech write-backs MERGE with existing auto fields instead of replacing them — catchphrase is union-merged (stored items kept, new candidates appended, deduplicated, joined with '／'), first_person / second_person are filled only when currently unset (an existing value is never overwritten), and memo / style in the result are treated as text already integrated with the existing tone (the request payload's note instructs the chat side to return them that way) and applied to the auto field as returned. A completed batch where every video was unreadable and no notes were produced flips the video preparation item to failed with the unreadable list as the reason; a failed video_transcript flips only the video item to failed with the reason — in both cases the profile itself and all other fields stay untouched and the profile remains usable. Write-backs for trashed profiles are recorded on the request only. CR-21: completed link_summary / video_transcript write-backs also record a portrayal verdict against the profile's current portrayal_focus (background.portrayal_focus_checks): result portrayal_focus_no_match: true (with portrayal_focus_no_match_reason) records a no_match for that kind; otherwise a completed link_summary records a match, and a video_transcript records a match when it produced video_notes (an all-unreadable batch with no notes records nothing unless the flag is present). The derived background.portrayal_focus_status is ok when any recorded check matched, failed when at least one check completed and all recorded checks are no_match (the latest reason is kept in portrayal_focus_failure_reason), and unknown otherwise. The verdict never alters content: a no-match write-back's summary/video_notes are stored exactly as returned (under the CR-21 contract they are built from all material), and the preparation state is untouched — a failed bias does not make the profile 要対応 and it stays ready/usable. While failed, the bias is inactive for switch output and every payload until a later check records a match. CR-21 addendum guard: when a result carries portrayal_focus_no_match, a summary / video_notes field that is missing — or that is just the bare 'no matching material' notice sentence — never overwrites the stored link_summary / video_notes; the stored full content is kept (only the verdict is recorded). CR-21 addendum 2: for link_summary / video_transcript requests whose payload carries the avatar_memory_repair marker (queued by updateProfile when portrayal_focus was removed), a completed result that returns a non-empty avatar_memory replaces the stored avatar_memory (the repaired text: specification-derived elements removed, other facts kept); a result without avatar_memory — or with an empty one — leaves the stored memory exactly as it was, and write-backs of non-repair requests never touch avatar_memory at all. CR-24: for chara_chat_sync, a completed write-back only stamps the profile's chara_chat_synced_at (the import itself happened in the target app); a failed one touches no profile field and no preparation item. A write-back for a request that is already completed or failed changes nothing and simply returns ok (idempotent). F-4: a trial_conversation write-back whose request payload carries base_greeting does not overwrite the greeting when the current greeting differs from base_greeting (the user edited it while the request was in flight) — the request still completes and the greeting preparation item resolves from the kept greeting. F-6: write-back merges honor the profile's deletion records — union merges never re-add a recorded catchphrase item or example line, a flavor trait whose label is recorded is never resurrected, and flavor_examples lines recorded as deleted are filtered out. F-3: a write-back that changes avatar_memory (the CR-21 repair path) advances data.avatar_memory_revision. D-4: a completed trial_conversation write-back that leaves the greeting item deriving as pending (no greeting in the write-back and none on file) with no open trial request remaining marks the greeting item failed with the reason 「書き戻しに挨拶文が含まれていませんでした」, judged on the post-write-back state so a user-typed greeting kept by F-4 is never misjudged. CR-RL-01: the same applies to link_summary — a completed link_summary write-back that leaves the link item deriving as pending (no summary in the write-back and none on file) with no open link_summary request remaining marks the link item failed with the reason 「書き戻しに要約が含まれていませんでした」; a write-back that carried a summary leaves the item done as before.",
     request: z.object({
       request_id: z.string().min(1),
       status: z.enum(["processing", "completed", "failed"]),
@@ -4980,6 +5843,10 @@ export const Actions = {
                   type: "image",
                   image_ref: blobKey ?? file ?? data.image_base.image_ref,
                 };
+                // F-7: a generated image that becomes the
+                // representative (the profile's first image) likewise
+                // invalidates a stored candidate_id.
+                if (first) data.candidate_id = null;
                 // CR-10: a generated image may report its dominant
                 // color as theme_color in the result; it becomes the
                 // theme color (auto) unless the user set it manually.
@@ -4988,6 +5855,25 @@ export const Actions = {
               }
             }
             if (req.kind === "trial_conversation") {
+              // F-4 (TC-19): if the user edited the greeting while
+              // this request was in flight — the current greeting no
+              // longer equals the base_greeting pinned at queue time
+              // — the generated text must NOT overwrite their edit
+              // (the same protection manual speech fields already
+              // have). The request still completes normally and the
+              // greeting preparation item resolves from the kept
+              // greeting below. Requests queued before base_greeting
+              // existed carry no pin and behave exactly as before.
+              let baseGreeting: string | null = null;
+              try {
+                const p = JSON.parse(req.payload) as Record<string, unknown>;
+                if (typeof p.base_greeting === "string")
+                  baseGreeting = p.base_greeting;
+              } catch {
+                baseGreeting = null;
+              }
+              const greetingEditedSinceQueue =
+                baseGreeting !== null && data.greeting !== baseGreeting;
               const greetingText =
                 (typeof parsed.greeting === "string" && parsed.greeting) ||
                 (typeof parsed.text === "string" && parsed.text) ||
@@ -4996,9 +5882,11 @@ export const Actions = {
                 "";
               if (greetingText) {
                 // Schema limit (greeting max 5000) — see link_summary note.
-                data.greeting = greetingText.slice(0, 5000);
+                if (!greetingEditedSinceQueue)
+                  data.greeting = greetingText.slice(0, 5000);
               } else if (args.result && !args.result.trim().startsWith("{")) {
-                data.greeting = args.result.slice(0, 5000);
+                if (!greetingEditedSinceQueue)
+                  data.greeting = args.result.slice(0, 5000);
               }
             }
             // Mark only this kind's item done (or none when it no longer
@@ -5072,11 +5960,18 @@ export const Actions = {
             const byTrait = extractFlavorExamples(parsed, data);
             if (byTrait.size > 0) {
               const flavor = data.flavor ?? emptyFlavor;
+              // F-6: example lines the user deleted for a trait
+              // (deletion record) are never re-added by a write-back.
+              const tombstonedExamples =
+                data.deletion_records?.flavor_examples ?? {};
               data.flavor = {
                 level: flavor.level,
                 traits: flavor.traits.map((t) => {
-                  const lines = byTrait.get(t.id);
-                  if (!lines) return t;
+                  const rawLines = byTrait.get(t.id);
+                  if (!rawLines) return t;
+                  const dead = new Set(tombstonedExamples[t.label] ?? []);
+                  const lines = rawLines.filter((l) => !dead.has(l));
+                  if (lines.length === 0) return t;
                   if (t.examples.some((e) => e.trim())) return t;
                   return { ...t, examples: lines };
                 }),
@@ -5322,6 +6217,46 @@ export const Actions = {
           }
         }
       }
+      // D-4: a completed trial_conversation write-back that carried
+      // no greeting leaves the greeting item deriving as pending with
+      // no open request behind it — it would sit at 準備中 forever, so
+      // fail it with the reason instead. The judgment uses the
+      // POST-write-back derivation: a greeting the user typed in the
+      // meantime (kept by the F-4 protection) resolves the item as
+      // done and nothing happens, and trashed profiles are never
+      // failed (the helper guards on deletedAt).
+      if (
+        args.status === "completed" &&
+        req.kind === "trial_conversation" &&
+        req.profileId
+      ) {
+        await failOrphanedPreparationItem(
+          ctx,
+          req.profileId,
+          req.kind,
+          "書き戻しに挨拶文が含まれていませんでした",
+        );
+      }
+      // CR-RL-01: the same rule for link_summary — a completed
+      // write-back that carried no summary leaves the link item
+      // deriving as pending (links on file, no summary) with no open
+      // request behind it, so fail it with the reason instead of
+      // letting the guarantee re-queue it on every later save. A
+      // write-back that DID carry a summary derives as done and
+      // nothing happens (judged on the post-write-back state, like
+      // the trial path above).
+      if (
+        args.status === "completed" &&
+        req.kind === "link_summary" &&
+        req.profileId
+      ) {
+        await failOrphanedPreparationItem(
+          ctx,
+          req.profileId,
+          req.kind,
+          "書き戻しに要約が含まれていませんでした",
+        );
+      }
       // CR-25: a completed image_generation write-back may have just
       // changed the profile's primary image — pre-generate its
       // thumbnail now so the list never has to.
@@ -5341,7 +6276,7 @@ export const Actions = {
 
   deleteGenerationRequest: defineAction({
     description:
-      "CR-15: Discards one generation request from the request lists. Only pending, processing, or failed requests can be deleted; a completed request is kept as history and this action rejects it. Deleting an open profile_apply request drops the target profile's pending-apply count (and its 反映待ち badge). When the deleted request was the last open one of its kind, a stale preparation hint left by it is cleared so the profile's preparation is re-derived from its actual content (a dismissed failure no longer shows as 要対応; a discarded link-summary requeue with an existing summary returns to done). The profile's content fields and all other requests are untouched.",
+      "CR-15: Discards one generation request from the request lists. Only pending, processing, or failed requests can be deleted; a completed request is kept as history and this action rejects it. Deleting an open profile_apply request drops the target profile's pending-apply count (and its 反映待ち badge). When the deleted request was the last open one of its kind, a stale preparation hint left by it is cleared so the profile's preparation is re-derived from its actual content (a discarded link-summary requeue with an existing summary returns to done; dismissing a failed request clears that failure — the item no longer shows as 要対応 — only when its content is actually on file, see D-4). The profile's content fields and all other requests are untouched. D-4: after the deletion, if no open request of the deleted request's kind remains and that kind's preparation item still derives as pending, the item is marked failed with the reason 「リクエストを取り消しました。再試行してください」 instead of sitting at 準備中 with nothing behind it — whatever status the deleted request had, so deleting even a failed request leaves the item failed (with this cancellation reason) when its content is still missing; trashed profiles are never marked failed this way. The D-4 failure marking covers only link_summary / trial_conversation / video_transcript; image_generation deletions never mark the image item failed, so a dismissed image failure stays cleared (CR-15).",
     request: z.object({ request_id: z.string().min(1) }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
@@ -5451,6 +6386,22 @@ export const Actions = {
           }
         }
       }
+      // D-4: after the deletion (and the hint cleanup above), if no
+      // open request of this kind remains and the item still derives
+      // as pending, the item would sit at 準備中 with nothing behind
+      // it — fail it with the cancellation reason instead, whatever
+      // status the deleted request had. When another open request
+      // remains, or the item re-derived to done/none, nothing
+      // happens. Trashed profiles are never failed (the helper
+      // guards on deletedAt, as does the cleanup above).
+      if (req.profileId && kindKey) {
+        await failOrphanedPreparationItem(
+          ctx,
+          req.profileId,
+          req.kind,
+          "リクエストを取り消しました。再試行してください",
+        );
+      }
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -5508,6 +6459,11 @@ export const Actions = {
         },
         origin: out.origin,
         candidate_id: out.candidate_id,
+        // F-3 / F-6: carried so a same-app import keeps the memory
+        // revision and the deletion records (candidate_id above is
+        // exported for completeness but never re-imported — F-7).
+        avatar_memory_revision: out.avatar_memory_revision,
+        deletion_records: out.deletion_records,
         favorite: out.favorite,
         created_at: out.created_at,
         updated_at: out.updated_at,
@@ -5714,7 +6670,17 @@ export const Actions = {
               ?.use_shared_info ?? true,
         },
         origin: { type: "imported", chat_link: null },
-        candidate_id: raw.candidate_id ?? null,
+        // F-7 (TC-N02): an imported profile never inherits the
+        // exporter's candidate_id — that candidate belongs to the
+        // source environment's apply flow.
+        candidate_id: null,
+        // F-3 / F-6: the memory revision and deletion records travel
+        // with an export from this app; absent in foreign files.
+        avatar_memory_revision:
+          typeof raw.avatar_memory_revision === "number"
+            ? raw.avatar_memory_revision
+            : undefined,
+        deletion_records: raw.deletion_records ?? undefined,
       });
       const id = await insertProfile(ctx, name, data, {
         favorite: raw.favorite === true,
@@ -5802,6 +6768,8 @@ export const Actions = {
       pending_generation_count: z.number(),
     }),
     async handler(ctx) {
+      // F-12: lazily purge trash entries past the 30-day retention.
+      await purgeExpiredTrash(ctx);
       const db = ctx.db<typeof schema>();
       const rows = await db
         .select()

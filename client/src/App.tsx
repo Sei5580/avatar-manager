@@ -356,6 +356,11 @@ type FormState = {
   voiceKind: string;
   voiceSpeed: string;
   avatarMemory: string;
+  // F-3: the avatar_memory revision as loaded with the profile. It is
+  // sent back unchanged with the save; if a generation write-back
+  // advanced the stored revision in the meantime, the server keeps
+  // the newer stored memory instead of this form's stale text.
+  avatarMemoryRevision: number;
   useSharedInfo: boolean;
   imageBaseType: "image" | "elements" | "none";
   imageRef: string;
@@ -415,6 +420,7 @@ function emptyForm(): FormState {
     voiceKind: "",
     voiceSpeed: "",
     avatarMemory: "",
+    avatarMemoryRevision: 0,
     useSharedInfo: true,
     imageBaseType: "none",
     imageRef: "",
@@ -459,6 +465,8 @@ function formFromProfile(p: Profile): FormState {
     voiceKind: p.voice.kind ?? "",
     voiceSpeed: p.voice.speed ?? "",
     avatarMemory: p.avatar_memory,
+    // F-3: hold the revision exactly as loaded (see FormState).
+    avatarMemoryRevision: p.avatar_memory_revision ?? 0,
     useSharedInfo: p.switch_settings.use_shared_info,
     imageBaseType: p.image_base.type,
     imageRef: p.image_base.image_ref ?? "",
@@ -1738,6 +1746,7 @@ function ProfileFormFields({
               </div>
             ))}
             <button type="button" aria-label="参考リンクを追加" className="mt-2 rounded-lg px-3 py-1.5 text-sm font-bold shadow-sm transition hover:opacity-90 active:scale-[0.98]" style={{ border: "1.5px solid var(--border)", background: "var(--surface-alt)" }} onClick={() => set({ bgLinks: [...form.bgLinks, ""] })}>＋ リンクを追加</button>
+            <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>読み取りは二段階が標準です（全プロファイル共通）：まず通常のテキスト取得で読み、読めなかったURLは実ブラウザで開いて再取得します。両方で読めなかった場合だけ「読み取り不可」として記録されます。</p>
           </div>
           <div>
             <span className="text-sm font-semibold">参考動画URL（複数可）</span>
@@ -3512,50 +3521,20 @@ function CreateView({ navigate }: { navigate: (v: View) => void }) {
           }),
         });
       }
-      const links = form.bgLinks.map((l) => l.trim()).filter(Boolean);
-      if (links.length > 0) {
-        await api.createGenerationRequest({
-          profile_id: id,
-          kind: "link_summary",
-          payload: JSON.stringify({ links }),
-        });
-      }
-      // Always queue greeting / trial conversation
-      await api.createGenerationRequest({
-        profile_id: id,
-        kind: "trial_conversation",
-        payload: JSON.stringify({
-          name: form.name.trim(),
-          speech_style: form.speechStyle || null,
-          tuning: form.tuning,
-          call_user_as: form.callUserAs || null,
-          speech_structured: {
-            first_person: form.speechFirstPerson || null,
-            second_person: form.speechSecondPerson || null,
-            call_user_as: form.callUserAs || null,
-            catchphrase: form.speechCatchphrase || null,
-            memo: form.speechMemo || null,
-          },
-          speech_sources: form.speechSources,
-          background: form.bgText,
-          user_relationship: form.userRelationship.trim() || null,
-          flavor_level: form.flavorLevel,
-          flavor_traits: form.flavorTraits.filter((t) => t.label.trim()).map((t) => ({
-            ...t,
-            frequency: t.frequency ?? null,
-            effective_frequency: effectiveFlavorFrequency(t, form.flavorLevel),
-          })),
-          links,
-          note: "新規作成時の挨拶文（greeting）として短い自己紹介・挨拶を生成してください。結果は {greeting: string} で返してください。口調の構造化欄のうち手動指定（speech_sources が manual）の欄は変更せず、未設定・自動の欄は背景から推定して result の speech に含めて返してください。user_relationship（私の扱い）が指定されている場合は、その関係性に倣った接し方で挨拶文を作ってください。フレーバー項目を推定できる場合は result の flavor_traits に含めて返してください（手動指定の項目は変更しないでください）。各フレーバー項目は effective_frequency（実効頻度）に従ってください（0の項目は出さない）。",
-        }),
-      });
+      // D-5: the link_summary and trial_conversation requests are no
+      // longer queued from here — createProfile's server-side
+      // preparation guarantee (D-1) queues exactly one of each during
+      // creation, from the saved profile, so no creation path can
+      // miss them. (The server-side trial note is the wording this
+      // form used to send, kept verbatim as a server constant.)
       // R-4 (CR-24): createProfile only stores the sync preference —
       // the chara_chat_sync request is queued HERE, after every other
-      // follow-up step (image registration and the image_generation /
-      // link_summary / trial_conversation requests) has completed, so
-      // the reflection carries the finished profile. A failure of this
-      // call does not fail the creation; the sync simply stays
-      // unqueued (charaSyncQueued stays false).
+      // follow-up step (image registration and the image_generation
+      // request; the link_summary / trial_conversation requests are
+      // queued server-side during createProfile itself, D-1/D-5) has
+      // completed, so the reflection carries the finished profile. A
+      // failure of this call does not fail the creation; the sync
+      // simply stays unqueued (charaSyncQueued stays false).
       let charaSyncQueued = false;
       if (syncChecked) {
         try {
@@ -3732,7 +3711,7 @@ function CreateView({ navigate }: { navigate: (v: View) => void }) {
           <button type="button" aria-label="保存する" className="rounded-lg px-5 py-2.5 text-sm font-bold text-white" style={{ background: "var(--accent)" }} disabled={saving} onClick={() => void save(false)}>{saving ? "保存中…" : "保存する（必須だけでも可）"}</button>
           <button type="button" aria-label="保存してすぐ切り替える" className="rounded-lg px-4 py-2 text-sm font-bold" style={{ border: "2px solid var(--accent)", color: "var(--accent)" }} disabled={saving} onClick={() => void save(true)}>保存してすぐ切り替える</button>
         </div>
-        <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>保存すると、背景リンクの要約・参考動画の文字起こし・挨拶文の生成リクエストが自動で登録されます。実際の読み取りや生成はチャット側の処理です。リクエスト一覧に表示される案内文をチャットに貼ると処理が始まります（キャラチャットへの同期だけは自動で処理されます）。</p>
+        <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>保存すると、背景リンクの要約・参考動画の文字起こし・挨拶文の生成リクエストが自動で登録されます。実際の読み取りや生成はチャット側の処理です。リンクや文字起こしの読み取りは二段階が標準です：まず通常のテキスト取得で読み、読めなかったものは実ブラウザで開いて再取得します（全プロファイル共通）。リクエスト一覧に表示される案内文をチャットに貼ると処理が始まります（キャラチャットへの同期だけは自動で処理されます）。</p>
       </div>
     </div>
   );
@@ -3853,7 +3832,18 @@ function DetailView({
       if (!form || !profile) throw new Error("フォームが準備できていません。");
       let f = form;
       if (memoryChoice === "duplicate") {
-        const data = formToData(form, profile);
+        // F-13: unify the duplicate routes — like the server-side
+        // duplicateProfile, the copy must not inherit candidate_id
+        // (it belongs to the original's apply flow) or the chara-chat
+        // synced state (chara_chat_synced_at: the copy itself has
+        // never been reflected). formToData carries both through from
+        // the original, so they are explicitly reset here. The sync
+        // preference itself is governed by the checkbox below.
+        const data = {
+          ...formToData(form, profile),
+          candidate_id: null,
+          chara_chat_synced_at: null,
+        };
         const created = await api.createProfile({
           name: `${form.name.trim()} のコピー`,
           data,
@@ -3951,6 +3941,9 @@ function DetailView({
         allow_clear: allowClear,
         apply_now: applyNow,
         sync_to_chara_chat: syncChecked,
+        // F-3: the revision this form loaded — a stale form cannot
+        // roll back a memory a generation write-back repaired since.
+        avatar_memory_revision: form.avatarMemoryRevision,
       });
       return {
         duplicatedTo: null as string | null,
@@ -4653,7 +4646,7 @@ function DetailView({
           (confirmDelete ? (
             <>
               <span className="flex items-center text-sm" style={{ color: "var(--accent)" }}>
-                本当に削除しますか？（30日間はゴミ箱から復元できます）
+                本当に削除しますか？（30日間はゴミ箱から復元でき、その後は自動で完全削除されます。キャラチャットに反映済みのキャラクターは、そちらでは消えません）
               </span>
               <button
                 type="button"
@@ -4687,7 +4680,7 @@ function DetailView({
             </button>
           ))}
       </div>
-      <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>保存すると、背景リンクの要約・参考動画の文字起こし・挨拶文の生成リクエストが自動で登録されます。実際の読み取りや生成はチャット側の処理です。リクエスト一覧に表示される案内文をチャットに貼ると処理が始まります（キャラチャットへの同期だけは自動で処理されます）。</p>
+      <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>保存すると、背景リンクの要約・参考動画の文字起こし・挨拶文の生成リクエストが自動で登録されます。実際の読み取りや生成はチャット側の処理です。リンクや文字起こしの読み取りは二段階が標準です：まず通常のテキスト取得で読み、読めなかったものは実ブラウザで開いて再取得します（全プロファイル共通）。リクエスト一覧に表示される案内文をチャットに貼ると処理が始まります（キャラチャットへの同期だけは自動で処理されます）。</p>
 
       {/* Images */}
       <section aria-label="アバター画像" className="mt-6">
@@ -5215,6 +5208,9 @@ function TrashView({ navigate }: { navigate: (v: View) => void }) {
         </button>
         <h2 className="font-display text-xl font-bold">ゴミ箱（30日間復元可）</h2>
       </div>
+      <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+        削除から30日を過ぎたプロファイルは、自動で完全削除されます。
+      </p>
       {trash.isPending && <p className="mt-4 text-sm">読み込み中…</p>}
       {trash.data && trash.data.profiles.length === 0 && (
         <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>
