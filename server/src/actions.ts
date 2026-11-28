@@ -1772,6 +1772,44 @@ function recoverImages(data: ProfileData): ProfileData {
   return data;
 }
 
+// CR-28: keep image_base.image_ref — the record the generation side
+// reads as "the base image" — in sync with the profile's images list.
+// Bug history: removeImage / setPrimaryImage never touched image_base,
+// and the edit form carried image_ref as load-time form state, so after
+// the user deleted a URL image and designated an uploaded image as
+// primary, image_ref kept pointing at the deleted image's URL. The
+// profile_apply payload then handed that stale URL to the chat side as
+// THE reference, while the actual primary (an upload) travelled only as
+// an internal blob key the chat side cannot open — so generation used
+// the deleted URL image instead of the designated upload.
+//
+// Rule: while the profile HAS images, the generation reference is the
+// effective primary entry (is_primary, else the entry the current ref
+// points at, else the first entry) and image_ref must equal that
+// entry's blob_key ?? file. The non-forced form (used on the read path)
+// only repairs values this app itself once recorded for an image entry
+// (an http(s) URL or an owned avatars/ blob key) — an opaque chat-side
+// reference (a workspace path or a candidate file id written back by a
+// profile_apply) is a record of the applied avatar and is left alone.
+// The forced form is used by the image-mutating actions and the update
+// merge, where the operation itself designates the primary image.
+// Profiles with no images keep image_ref as a standalone reference
+// record (the file lives chat-side), exactly as before.
+function syncImageBaseRef(data: ProfileData, force: boolean): void {
+  if (data.images.length === 0) return;
+  const primary = findPrimaryImageEntry(data) ?? data.images[0];
+  if (!primary) return;
+  const target = primary.blob_key ?? primary.file;
+  if (!target || data.image_base.image_ref === target) return;
+  if (!force) {
+    const ref = data.image_base.image_ref;
+    const appRecorded =
+      ref === null || /^https?:\/\//.test(ref) || ref.startsWith("avatars/");
+    if (!appRecorded) return;
+  }
+  data.image_base = { ...data.image_base, image_ref: target };
+}
+
 // D-02 / R-01 / R-12 partial-update merge: fields that are managed outside
 // the plain edit form (image list, generation results) must survive an
 // update whose payload did not carry them. `before` is the stored profile,
@@ -2190,6 +2228,15 @@ function mergePreservingManagedFields(
   if (out.chara_chat_sync === null && before.chara_chat_sync !== null) {
     out.chara_chat_sync = before.chara_chat_sync;
   }
+  // CR-28: the merged images list is the current truth — the generation
+  // reference (image_base.image_ref) follows its effective primary
+  // entry, so a payload carrying a stale image_ref (e.g. the edit
+  // form's load-time value for an image the user has since deleted)
+  // can never re-poison the record. Skipped only when the caller
+  // explicitly manages the whole base via allow_clear "image_base".
+  if (!allowClear.includes("image_base")) {
+    syncImageBaseRef(out, true);
+  }
   return out;
 }
 
@@ -2252,7 +2299,11 @@ function parseData(raw: string): ProfileData {
     const parsed = profileDataSchema.parse(JSON.parse(raw));
     // Re-derive preparation for legacy rows that had no preparation /
     // greeting, and recover an images list lost to D-02 from image_ref.
-    return withPreparation(recoverImages(parsed));
+    // CR-28: also repair a dangling generation reference (image_ref
+    // still pointing at an image that is no longer in the images list).
+    const recovered = recoverImages(parsed);
+    syncImageBaseRef(recovered, false);
+    return withPreparation(recovered);
   } catch {
     const fallback = profileDataSchema.parse({
       summary: "",
@@ -2351,6 +2402,84 @@ function findPrimaryImageEntry(data: ProfileData): ImageEntry | undefined {
       ? data.images.find((i) => i.blob_key === ref || i.file === ref)
       : undefined)
   );
+}
+
+// CR-28: the reference image handed to the chat side for generation is
+// ALWAYS resolved from the profile's current primary image — never from
+// a free-floating image_ref value. Uploaded images travel with `url`
+// (the serving URL this app itself uses to display the image), because
+// the bare blob_key is an internal storage key the chat side cannot
+// open; URL images travel with the URL itself. The note pins the
+// contract: no silent substitution of any other image found in the
+// profile — when the reference cannot be obtained, the chat side fails
+// the request visibly instead.
+const REFERENCE_IMAGE_NOTE =
+  "参照画像について：アバター生成・作成の参照画像は reference_image（現在の代表画像）だけです。source が upload の場合は url（このアプリが画像表示に使う配信URL）を開いて実物を取得してください（blob_key はアプリ内部の保存キーで、そのままでは開けません）。プロファイル内に残っている他のURLや、現在の代表画像と一致しない image_ref の値を参照画像の代わりに使わないでください。reference_image を取得できない場合は、別の画像で代用せず、書き戻しで failed にして「参照画像を取得できなかった」旨を理由に明記してください。";
+
+type ReferenceImage = {
+  id: string | null;
+  source: string;
+  file: string | null;
+  blob_key: string | null;
+  url: string | null;
+};
+
+// Resolves the generation reference for a profile: the effective
+// primary image entry when the profile has images (ref_value = its
+// blob_key ?? file, matching the synced image_base.image_ref), else the
+// standalone image_ref record when there are no images (a URL, an owned
+// blob key, or a chat-side file reference), else null.
+async function buildReferenceImage(
+  ctx: Ctx,
+  data: ProfileData,
+): Promise<{ ref_value: string | null; reference: ReferenceImage | null }> {
+  const primary = findPrimaryImageEntry(data) ?? data.images[0] ?? null;
+  if (primary) {
+    let url: string | null = null;
+    if (primary.blob_key) {
+      try {
+        url = await ctx.blobs.getUrl(primary.blob_key);
+      } catch {
+        url = null;
+      }
+    } else if (/^https?:\/\//.test(primary.file)) {
+      url = primary.file;
+    }
+    return {
+      ref_value: primary.blob_key ?? primary.file,
+      reference: {
+        id: primary.id,
+        source: primary.source,
+        file: primary.file,
+        blob_key: primary.blob_key,
+        url,
+      },
+    };
+  }
+  const ref = data.image_base.image_ref;
+  if (ref) {
+    let url: string | null = null;
+    if (/^https?:\/\//.test(ref)) {
+      url = ref;
+    } else if (ref.startsWith("avatars/")) {
+      try {
+        url = await ctx.blobs.getUrl(ref);
+      } catch {
+        url = null;
+      }
+    }
+    return {
+      ref_value: ref,
+      reference: {
+        id: null,
+        source: "reference",
+        file: ref,
+        blob_key: ref.startsWith("avatars/") ? ref : null,
+        url,
+      },
+    };
+  }
+  return { ref_value: null, reference: null };
 }
 
 // Returns the thumbnail URL for one image entry, generating and storing
@@ -2700,6 +2829,22 @@ const switchRequestOut = z.object({
   // reference material for the conversation after the switch. Null
   // when no video transcript has been processed.
   video_notes: z.string().nullable(),
+  // CR-28: the generation reference for the switch, resolved from the
+  // target profile's CURRENT primary image — uploads carry an openable
+  // `url` (the bare blob_key is an internal storage key). Null when the
+  // profile has no image at all. reference_image_note carries the
+  // no-substitution contract (never fall back to another image found in
+  // the profile; fail visibly when the reference cannot be obtained).
+  reference_image: z
+    .object({
+      id: z.string().nullable(),
+      source: z.string(),
+      file: z.string().nullable(),
+      blob_key: z.string().nullable(),
+      url: z.string().nullable(),
+    })
+    .nullable(),
+  reference_image_note: z.string().nullable(),
   created_at: z.string(),
   updated_at: z.string(),
 });
@@ -2725,6 +2870,7 @@ function buildSwitchOut(
   row: SwitchRow,
   name: string,
   profData: ProfileData | null,
+  reference: ReferenceImage | null = null,
 ): z.infer<typeof switchRequestOut> {
   const userRelationship = profData
     ? (profData.background.user_relationship ?? null)
@@ -2746,6 +2892,10 @@ function buildSwitchOut(
     address_note: ADDRESS_NOTE,
     flavor: profData ? mergedFlavorView(profData) : { level: 3, traits: [] },
     video_notes: profData ? (profData.background.video_notes ?? null) : null,
+    // CR-28: resolved by toSwitchOutMany from the profile's current
+    // primary image (see buildReferenceImage).
+    reference_image: reference,
+    reference_image_note: reference ? REFERENCE_IMAGE_NOTE : null,
     created_at: row.createdAt.toISOString(),
     updated_at: row.updatedAt.toISOString(),
   };
@@ -2772,12 +2922,29 @@ async function toSwitchOutMany(
     .from(schema.profiles)
     .where(inArray(schema.profiles.id, ids));
   const byId = new Map(profs.map((p) => [p.id, p]));
+  const parsedById = new Map(
+    profs.map((p) => [p.id, parseData(p.data)] as const),
+  );
+  // CR-28: resolve each profile's generation reference (current
+  // primary image, uploads with an openable url) for the switch
+  // handover.
+  const referenceById = new Map<string, ReferenceImage | null>();
+  await Promise.all(
+    profs.map(async (p) => {
+      const parsed = parsedById.get(p.id);
+      const { reference } = parsed
+        ? await buildReferenceImage(ctx, parsed)
+        : { reference: null };
+      referenceById.set(p.id, reference);
+    }),
+  );
   return rows.map((row) => {
     const prof = byId.get(row.profileId);
     return buildSwitchOut(
       row,
       prof?.name ?? "(削除済み)",
-      prof ? parseData(prof.data) : null,
+      prof ? (parsedById.get(prof.id) ?? null) : null,
+      prof ? (referenceById.get(prof.id) ?? null) : null,
     );
   });
 }
@@ -3095,15 +3262,17 @@ async function insertProfile(
   const db = ctx.db<typeof schema>();
   const id = newId("av");
   const now = new Date();
-  const clean: ProfileData = withPreparation(
-    recoverImages({
-      ...data,
-      switch_settings: {
-        pass_conversation_summary: false,
-        use_shared_info: data.switch_settings.use_shared_info,
-      },
-    }),
-  );
+  const recovered = recoverImages({
+    ...data,
+    switch_settings: {
+      pass_conversation_summary: false,
+      use_shared_info: data.switch_settings.use_shared_info,
+    },
+  });
+  // CR-28: a create/import payload that carries both an images list and
+  // a mismatched image_ref starts out synced (see syncImageBaseRef).
+  syncImageBaseRef(recovered, true);
+  const clean: ProfileData = withPreparation(recovered);
   await db.insert(schema.profiles).values({
     id,
     name,
@@ -3280,7 +3449,7 @@ export const Actions = {
 
   updateProfile: defineAction({
     description:
-      "Partially updates a profile's editable fields, first saving the previous version into its history (latest 20 kept). Fields the payload leaves empty keep their stored values (D-02): images, greeting, link_summary, avatar_memory, candidate_id, summary, background text/links, call_user_as, speech style, voice kind/speed, and the whole image_base (type, image_ref, and all 13 elements — a default-stub image_base never overwrites a stored one). List a field in allow_clear to clear it intentionally (\"image_base\" / \"elements\" / \"elements:<key>\" / \"image_ref\" address the image base). If background.links were added or changed and are non-empty, a link_summary regeneration request is queued automatically and preparation returns to pending; link_summary_requeued in the response reports whether that happened. CR-03: with apply_now=true the save also queues exactly one immediate-apply request — a profile_apply generation request (payload: image_ref, primary image, name, speech style, call_user_as) when the profile is active, or a normal switch request when it is not; apply_kind/apply_request_id in the response report which. apply_now=false (default) is save-only. CR-04: apply_phrase carries the canned phrase for that request (paste it into chat to trigger it). CR-06: speech carries structured fields (structured.first_person/second_person/catchphrase/memo plus top-level call_user_as and speech.style) with per-field sources (speech.sources: auto/manual/null); values changed through this action become manual and are protected from generation write-backs, empty speech fields keep stored values unless listed in allow_clear (speech_first_person / speech_second_person / speech_catchphrase / speech_memo), and the profile_apply payload includes the merged speech fields (speech / speech_structured / speech_sources). CR-07: background.user_relationship is the optional 「私の扱い」 (what the user is to this character — master, friend, …); it is preserved on empty like the other background fields (allow_clear: \"user_relationship\" clears it intentionally), is carried in the auto link_summary requeue payload and in the profile_apply payload (user_relationship / background_user_relationship), and switch requests expose it on their output for the chat side. CR-08: data.flavor is the フレーバー設定 {level 0-5 (default 3), traits[{id, label, examples[], scenes[], enabled, source auto/manual}]}; traits added/changed through this action become manual (protected from generation write-backs), an empty traits payload keeps the stored flavor unless allow_clear lists \"flavor_traits\", and the profile_apply payload includes the merged flavor (flavor / flavor_level / flavor_traits / flavor_enabled_traits: level + enabled traits only). CR-10: data carries theme_color (#rrggbb) + theme_color_source (auto/manual/default); a manual theme color is never overwritten by automatic acquisition or stub payloads (list \"theme_color\" in allow_clear when the user changed it or returned it to automatic on purpose), and a still-default profile is initialized from its appearance elements on read. CR-14: each flavor trait also carries frequency (0-5 or null; null = follow the global level, a number overrides it for that trait only, same stage meanings as the global bar). Switch output, profile_apply payloads, and generation payloads carry per-trait effective_frequency (frequency ?? level) and frequency_is_custom; a trait with effective_frequency 0 is handed over with 0 explicitly and must be treated like a disabled trait (never shown). Legacy traits parse with frequency null, so existing profiles behave exactly as before. CR-12: each flavor trait carries auto_examples (「例文を自動作成」); when a save leaves any trait with auto_examples on and no examples, a flavor_examples generation request is queued for the profile (an already-open one is refreshed with the current targets instead of duplicated) and its id is returned as flavor_examples_request_id. The request payload carries the target traits (id/label/scenes) plus speech, summary, background summary, and user_relationship as context. CR-17: background carries video_urls (参考動画URL, kept separate from links), video_notes (tone findings from the videos' dialogue), unreadable_videos, and video_processed_urls; video_urls are preserved on empty like links (allow_clear: \"video_urls\" clears them intentionally) and the generation-managed video fields survive stub payloads. When a save leaves any video URL no transcript attempt has covered, exactly one video_transcript generation request is queued or refreshed for the profile and its id is returned as video_transcript_request_id; the profile_apply payload and the auto link_summary requeue carry video_notes as tone reference material. CR-23: video_urls may include YouTube playlist URLs (youtube.com/playlist?list=…); they are stored and queued like any other video URL, and the video_transcript payload flags them (playlist_urls + playlist_note) so the chat side transcribes every video in the list. CR-19: background.portrayal_focus is the optional 「演じる姿・状況」 (a specific portrayal/situation to bias toward — 中学生の時のみ / 闇落ちした状態 / もしものif設定 etc.); it is preserved on empty like user_relationship (allow_clear: \"portrayal_focus\" clears it intentionally). Only when set: generation payloads carry portrayal_focus + portrayal_focus_note (use ONLY the material matching that portrayal/situation; for videos pick the matching chapters/segments; if nothing matches, report that in the write-back instead of filling from other states), and the profile_apply payload carries it with the acting premise (respond in that portrayal/situation). When empty, no portrayal keys or bias instructions appear anywhere and behavior is exactly as before. CR-20: when portrayal_focus actually changes in a save (set, changed, or cleared), re-inference is queued under the new bias — a link_summary request is re-queued when the profile has background links, and a video_transcript request is re-queued with force (already-processed videos included) when it has reference videos; a save that leaves the value unchanged queues neither for this reason. CR-21: background also carries the portrayal check state (portrayal_focus_status: unknown/ok/failed, portrayal_focus_failure_reason, portrayal_focus_checks {link_summary, video_transcript: match/no_match/null}) — it is generation-managed (write-backs and this action's reset are the only writers; payloads cannot set it). When portrayal_focus actually changes, the state resets to unknown with no checks and no reason, and the CR-20 re-queue re-judges it. While the state is failed, the bias is inactive: the profile_apply payload built here carries no portrayal keys, exactly like an unused field. CR-21 addendum: CLEARING portrayal_focus (empty value + allow_clear) counts as a change exactly like setting/editing it — including while the state is failed, the reset and the re-queue (link_summary when links exist, video_transcript with force when videos exist) always fire together, so the full-material write-backs that follow restore link_summary / video_notes to normal content and the failed state/badge clears. CR-21 addendum 2: the set → cleared transition is additionally a repair trigger for avatar_memory — the re-queue payloads fired by that save (link_summary and/or video_transcript) carry the current avatar_memory with avatar_memory_repair: true and an instruction to remove any elements written into the memory because of the removed specification (keeping all other facts) and return the repaired text as the write-back's avatar_memory. A save where portrayal_focus does not actually change fires no re-queue and no memory repair, and profiles that never had a focus are completely unaffected. CR-22: the profile_apply payload queued with apply_now=true always carries address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方), for every profile regardless of its call_user_as / second_person settings; it is a handover note only and changes no stored profile data. CR-24: the request also accepts sync_to_chara_chat (the edit form's 「キャラチャットに反映する」 checkbox): when present it becomes the stored data.chara_chat_sync preference (an absent value preserves the stored preference; a payload leaving the data field null likewise), and when true this save additionally queues (or refreshes) exactly one chara_chat_sync generation request for the profile — but only when a receiver app is discovered in this environment under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction, whose protocol response the mediator verifies before pushing; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus; no fixed destination); the request payload and the kicked mediator carry the DISCOVERED target slug, and chara_chat_sync_request_id / chara_chat_target_slug in the response report the outcome (both null when off, absent, trashed, or no target found). data.chara_chat_synced_at is write-back-managed (only a completed chara_chat_sync write-back sets it) and survives every payload.",
+      "Partially updates a profile's editable fields, first saving the previous version into its history (latest 20 kept). Fields the payload leaves empty keep their stored values (D-02): images, greeting, link_summary, avatar_memory, candidate_id, summary, background text/links, call_user_as, speech style, voice kind/speed, and the whole image_base (type, image_ref, and all 13 elements — a default-stub image_base never overwrites a stored one). List a field in allow_clear to clear it intentionally (\"image_base\" / \"elements\" / \"elements:<key>\" / \"image_ref\" address the image base). If background.links were added or changed and are non-empty, a link_summary regeneration request is queued automatically and preparation returns to pending; link_summary_requeued in the response reports whether that happened. CR-03: with apply_now=true the save also queues exactly one immediate-apply request — a profile_apply generation request (payload: image_ref, primary image, name, speech style, call_user_as) when the profile is active, or a normal switch request when it is not; apply_kind/apply_request_id in the response report which. apply_now=false (default) is save-only. CR-04: apply_phrase carries the canned phrase for that request (paste it into chat to trigger it). CR-06: speech carries structured fields (structured.first_person/second_person/catchphrase/memo plus top-level call_user_as and speech.style) with per-field sources (speech.sources: auto/manual/null); values changed through this action become manual and are protected from generation write-backs, empty speech fields keep stored values unless listed in allow_clear (speech_first_person / speech_second_person / speech_catchphrase / speech_memo), and the profile_apply payload includes the merged speech fields (speech / speech_structured / speech_sources). CR-07: background.user_relationship is the optional 「私の扱い」 (what the user is to this character — master, friend, …); it is preserved on empty like the other background fields (allow_clear: \"user_relationship\" clears it intentionally), is carried in the auto link_summary requeue payload and in the profile_apply payload (user_relationship / background_user_relationship), and switch requests expose it on their output for the chat side. CR-08: data.flavor is the フレーバー設定 {level 0-5 (default 3), traits[{id, label, examples[], scenes[], enabled, source auto/manual}]}; traits added/changed through this action become manual (protected from generation write-backs), an empty traits payload keeps the stored flavor unless allow_clear lists \"flavor_traits\", and the profile_apply payload includes the merged flavor (flavor / flavor_level / flavor_traits / flavor_enabled_traits: level + enabled traits only). CR-10: data carries theme_color (#rrggbb) + theme_color_source (auto/manual/default); a manual theme color is never overwritten by automatic acquisition or stub payloads (list \"theme_color\" in allow_clear when the user changed it or returned it to automatic on purpose), and a still-default profile is initialized from its appearance elements on read. CR-14: each flavor trait also carries frequency (0-5 or null; null = follow the global level, a number overrides it for that trait only, same stage meanings as the global bar). Switch output, profile_apply payloads, and generation payloads carry per-trait effective_frequency (frequency ?? level) and frequency_is_custom; a trait with effective_frequency 0 is handed over with 0 explicitly and must be treated like a disabled trait (never shown). Legacy traits parse with frequency null, so existing profiles behave exactly as before. CR-12: each flavor trait carries auto_examples (「例文を自動作成」); when a save leaves any trait with auto_examples on and no examples, a flavor_examples generation request is queued for the profile (an already-open one is refreshed with the current targets instead of duplicated) and its id is returned as flavor_examples_request_id. The request payload carries the target traits (id/label/scenes) plus speech, summary, background summary, and user_relationship as context. CR-17: background carries video_urls (参考動画URL, kept separate from links), video_notes (tone findings from the videos' dialogue), unreadable_videos, and video_processed_urls; video_urls are preserved on empty like links (allow_clear: \"video_urls\" clears them intentionally) and the generation-managed video fields survive stub payloads. When a save leaves any video URL no transcript attempt has covered, exactly one video_transcript generation request is queued or refreshed for the profile and its id is returned as video_transcript_request_id; the profile_apply payload and the auto link_summary requeue carry video_notes as tone reference material. CR-23: video_urls may include YouTube playlist URLs (youtube.com/playlist?list=…); they are stored and queued like any other video URL, and the video_transcript payload flags them (playlist_urls + playlist_note) so the chat side transcribes every video in the list. CR-19: background.portrayal_focus is the optional 「演じる姿・状況」 (a specific portrayal/situation to bias toward — 中学生の時のみ / 闇落ちした状態 / もしものif設定 etc.); it is preserved on empty like user_relationship (allow_clear: \"portrayal_focus\" clears it intentionally). Only when set: generation payloads carry portrayal_focus + portrayal_focus_note (use ONLY the material matching that portrayal/situation; for videos pick the matching chapters/segments; if nothing matches, report that in the write-back instead of filling from other states), and the profile_apply payload carries it with the acting premise (respond in that portrayal/situation). When empty, no portrayal keys or bias instructions appear anywhere and behavior is exactly as before. CR-20: when portrayal_focus actually changes in a save (set, changed, or cleared), re-inference is queued under the new bias — a link_summary request is re-queued when the profile has background links, and a video_transcript request is re-queued with force (already-processed videos included) when it has reference videos; a save that leaves the value unchanged queues neither for this reason. CR-21: background also carries the portrayal check state (portrayal_focus_status: unknown/ok/failed, portrayal_focus_failure_reason, portrayal_focus_checks {link_summary, video_transcript: match/no_match/null}) — it is generation-managed (write-backs and this action's reset are the only writers; payloads cannot set it). When portrayal_focus actually changes, the state resets to unknown with no checks and no reason, and the CR-20 re-queue re-judges it. While the state is failed, the bias is inactive: the profile_apply payload built here carries no portrayal keys, exactly like an unused field. CR-21 addendum: CLEARING portrayal_focus (empty value + allow_clear) counts as a change exactly like setting/editing it — including while the state is failed, the reset and the re-queue (link_summary when links exist, video_transcript with force when videos exist) always fire together, so the full-material write-backs that follow restore link_summary / video_notes to normal content and the failed state/badge clears. CR-21 addendum 2: the set → cleared transition is additionally a repair trigger for avatar_memory — the re-queue payloads fired by that save (link_summary and/or video_transcript) carry the current avatar_memory with avatar_memory_repair: true and an instruction to remove any elements written into the memory because of the removed specification (keeping all other facts) and return the repaired text as the write-back's avatar_memory. A save where portrayal_focus does not actually change fires no re-queue and no memory repair, and profiles that never had a focus are completely unaffected. CR-22: the profile_apply payload queued with apply_now=true always carries address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方), for every profile regardless of its call_user_as / second_person settings; it is a handover note only and changes no stored profile data. CR-24: the request also accepts sync_to_chara_chat (the edit form's 「キャラチャットに反映する」 checkbox): when present it becomes the stored data.chara_chat_sync preference (an absent value preserves the stored preference; a payload leaving the data field null likewise), and when true this save additionally queues (or refreshes) exactly one chara_chat_sync generation request for the profile — but only when a receiver app is discovered in this environment under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction, whose protocol response the mediator verifies before pushing; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus; no fixed destination); the request payload and the kicked mediator carry the DISCOVERED target slug, and chara_chat_sync_request_id / chara_chat_target_slug in the response report the outcome (both null when off, absent, trashed, or no target found). data.chara_chat_synced_at is write-back-managed (only a completed chara_chat_sync write-back sets it) and survives every payload. CR-28: while the profile has images, image_base.image_ref is not an independent value — after the merge it is re-derived from the effective primary image entry (its blob_key ?? file), so a stale image_ref carried by the payload (e.g. the edit form's load-time value for an image the user has since deleted) cannot survive the save; the profile_apply payload likewise resolves its generation reference from the current primary image (reference_image — uploads carry an openable url alongside the internal blob_key) and carries reference_image_note, which forbids substituting any other image found in the profile and requires a failed write-back when the reference cannot be obtained.",
     request: z.object({
       id: z.string().min(1),
       name: z.string().trim().min(1).max(100),
@@ -3527,7 +3696,16 @@ export const Actions = {
       if (args.apply_now && !row.deletedAt) {
         if (row.isActive) {
           const primary =
-            clean.images.find((i) => i.is_primary) ?? clean.images[0] ?? null;
+            findPrimaryImageEntry(clean) ?? clean.images[0] ?? null;
+          // CR-28: the reference handed over for (re)generation is
+          // resolved from the CURRENT primary image — with an openable
+          // url for uploads — never from a free-floating image_ref
+          // value, so a stale record can no longer substitute a deleted
+          // image for the designated one.
+          const { ref_value, reference } = await buildReferenceImage(
+            ctx,
+            clean,
+          );
           apply_request_id = newId("gen");
           await insertPendingGenerationRequest(db, {
             id: apply_request_id,
@@ -3537,19 +3715,26 @@ export const Actions = {
               name: args.name,
               image_base: {
                 type: clean.image_base.type,
-                image_ref: clean.image_base.image_ref,
+                image_ref: ref_value,
               },
-              image_ref: clean.image_base.image_ref,
+              image_ref: ref_value,
               primary_image: primary
                 ? {
                     id: primary.id,
                     file: primary.file,
                     blob_key: primary.blob_key,
                     source: primary.source,
+                    url:
+                      reference && reference.id === primary.id
+                        ? reference.url
+                        : null,
                   }
                 : null,
-              primary_image_file:
-                primary?.file ?? clean.image_base.image_ref,
+              primary_image_file: primary?.file ?? ref_value,
+              // CR-28: the single authoritative generation reference,
+              // plus the no-substitution contract.
+              reference_image: reference,
+              reference_image_note: reference ? REFERENCE_IMAGE_NOTE : null,
               speech_style: clean.speech.style,
               speech_tuning: clean.speech.tuning,
               call_user_as: clean.call_user_as,
@@ -3593,6 +3778,7 @@ export const Actions = {
               summary: clean.summary,
               note:
                 "アクティブなプロファイルの更新を即時反映してください。口調・名前・呼び方は即時適用し、画像が変わっていれば候補生成→ユーザー選択→セットまで行ってください。user_relationship（私の扱い）が指定されている場合は、切り替え後のユーザーへの接し方（距離感・態度）の基準としてそれを正としてください。未指定（null）の場合は背景や呼び方から自然に推定される扱いのままで構いません。video_notes（参考動画の台詞から読み取れた口調の特徴）がある場合は、口調の参考資料として併せて使ってください。flavor（フレーバー設定）がある場合は、各項目の実効頻度（effective_frequency = 項目の frequency ?? 全体の level）に従って応答にキャラクターらしいフレーバーを出してください（実効0=その項目は出さない、1〜2=ここぞの場面だけ、3=節目に自然に、4〜5=頻繁に）。全体の level だけで判断せず、項目ごとの effective_frequency を優先してください。書き戻しは candidate_id と image_ref のみです。" +
+                (reference ? ` ${REFERENCE_IMAGE_NOTE}` : "") +
                 (portrayalEffectiveValue(clean)
                   ? ` ${portrayalActingNote(portrayalEffectiveValue(clean) as string)}`
                   : ""),
@@ -3810,7 +3996,7 @@ export const Actions = {
 
   uploadImage: defineAction({
     description:
-      "Stores an uploaded image (PNG/JPG/WebP, up to about 10MB) as a blob and adds it to the profile's image list. CR-10: theme_color_candidate (the image's dominant color as a #rrggbb hex, extracted client-side) becomes the profile's theme color with source auto — unless the user set the theme color manually, in which case the manual color is kept.",
+      "Stores an uploaded image (PNG/JPG/WebP, up to about 10MB) as a blob and adds it to the profile's image list. CR-10: theme_color_candidate (the image's dominant color as a #rrggbb hex, extracted client-side) becomes the profile's theme color with source auto — unless the user set the theme color manually, in which case the manual color is kept. CR-28: image_base.image_ref follows the effective primary entry — the new upload only becomes the generation reference when it became primary.",
     request: z.object({
       profile_id: z.string().min(1),
       data_base64: z.string().min(1).max(14_000_000),
@@ -3836,7 +4022,12 @@ export const Actions = {
         { id: imageId, file: key, blob_key: key, source: "upload" },
         makePrimary,
       );
-      data.image_base = { ...data.image_base, type: "image", image_ref: key };
+      data.image_base = { ...data.image_base, type: "image" };
+      // CR-28: the generation reference follows the effective primary
+      // entry — the new upload when it became primary, the existing
+      // primary when it did not (previously image_ref was overwritten
+      // with the new image's key unconditionally).
+      syncImageBaseRef(data, true);
       // CR-10: a new representative image re-acquires the theme color
       // from the image — except when the user picked it manually.
       applyThemeColorCandidate(data, args.theme_color_candidate);
@@ -3858,7 +4049,7 @@ export const Actions = {
 
   addImageByUrl: defineAction({
     description:
-      "Registers an image URL as one of the profile's images. CR-10: theme_color_candidate (#rrggbb, extracted client-side when the image is readable) becomes the theme color with source auto, unless the theme color was set manually.",
+      "Registers an image URL as one of the profile's images. CR-10: theme_color_candidate (#rrggbb, extracted client-side when the image is readable) becomes the theme color with source auto, unless the theme color was set manually. CR-28: image_base.image_ref follows the effective primary entry — the added URL only becomes the generation reference when it became primary.",
     request: z.object({
       profile_id: z.string().min(1),
       url: z.string().url().max(2000),
@@ -3878,11 +4069,10 @@ export const Actions = {
         { id: imageId, file: args.url, blob_key: null, source: "url" },
         makePrimary,
       );
-      data.image_base = {
-        ...data.image_base,
-        type: "image",
-        image_ref: args.url,
-      };
+      data.image_base = { ...data.image_base, type: "image" };
+      // CR-28: same rule as uploadImage — image_ref follows the
+      // effective primary entry, not unconditionally the added URL.
+      syncImageBaseRef(data, true);
       // CR-10: same manual-priority theme re-acquisition as uploadImage.
       applyThemeColorCandidate(data, args.theme_color_candidate);
       data.preparation = { ...data.preparation, image: "done" };
@@ -3903,7 +4093,7 @@ export const Actions = {
 
   setPrimaryImage: defineAction({
     description:
-      "Makes one of the profile's images the primary image. CR-10: theme_color_candidate (#rrggbb for the new primary image) re-acquires the theme color as auto, unless it was set manually.",
+      "Makes one of the profile's images the primary image. CR-10: theme_color_candidate (#rrggbb for the new primary image) re-acquires the theme color as auto, unless it was set manually. CR-28: the generation reference (image_base.image_ref) moves to the designated image as well.",
     request: z.object({
       profile_id: z.string().min(1),
       image_id: z.string().min(1),
@@ -3921,6 +4111,10 @@ export const Actions = {
         ...img,
         is_primary: img.id === args.image_id,
       }));
+      // CR-28: designating a new primary also moves the generation
+      // reference (image_base.image_ref) to that image — previously the
+      // ref kept pointing at the previous base image.
+      syncImageBaseRef(data, true);
       applyThemeColorCandidate(data, args.theme_color_candidate);
       await db
         .update(schema.profiles)
@@ -3934,7 +4128,7 @@ export const Actions = {
   }),
 
   removeImage: defineAction({
-    description: "Removes one image from a profile (older images stay until removed). The image's blob is deleted only when no other profile references the same blob key — duplicated profiles share blobs, so a still-referenced blob is kept.",
+    description: "Removes one image from a profile (older images stay until removed). The image's blob is deleted only when no other profile references the same blob key — duplicated profiles share blobs, so a still-referenced blob is kept. CR-28: the generation reference (image_base.image_ref) follows the removal — it re-points at the new effective primary when images remain, and is cleared when the removed image was the last one and the ref pointed at it, so a deleted image can never remain the generation reference (or be resurrected from the dangling ref).",
     request: z.object({
       profile_id: z.string().min(1),
       image_id: z.string().min(1),
@@ -3947,6 +4141,28 @@ export const Actions = {
       const target = data.images.find((i) => i.id === args.image_id);
       data.images = data.images.filter((i) => i.id !== args.image_id);
       if (target?.is_primary && data.images[0]) data.images[0].is_primary = true;
+      // CR-28: the generation reference (image_base.image_ref) follows
+      // the images list. When images remain it re-points at the new
+      // effective primary; when the removed image was the last one and
+      // the ref pointed at it (or it was the primary), the ref is
+      // cleared — a dangling ref would otherwise keep the deleted image
+      // as the generation reference and recoverImages would resurrect
+      // it as an entry on the next read. A standalone ref that never
+      // pointed at the removed entry (a chat-side reference record for
+      // a profile whose images live elsewhere) is left untouched.
+      if (data.images.length === 0) {
+        const ref = data.image_base.image_ref;
+        if (
+          target &&
+          (target.is_primary ||
+            (ref !== null &&
+              (target.blob_key === ref || target.file === ref)))
+        ) {
+          data.image_base = { ...data.image_base, image_ref: null };
+        }
+      } else {
+        syncImageBaseRef(data, true);
+      }
       if (target?.blob_key) {
         // R-9: duplicated profiles share the blob — deleting it here
         // would break the other profile's image. Only delete when no
@@ -4071,7 +4287,7 @@ export const Actions = {
 
   requestSwitch: defineAction({
     description:
-      "Creates a pending switch request for a profile (one tap, no confirmation). Returns the request id and the canned phrase to send in chat so the agent applies the switch. The request output also carries the profile's 「私の扱い」 (background.user_relationship, CR-07) as the basis for how to treat the user after the switch, its merged flavor setting (CR-08: level + enabled traits), and video_notes (CR-17: tone findings from the reference videos' dialogue) in listPendingSwitchRequests output. CR-19: the output also carries portrayal_focus + portrayal_focus_note (「演じる姿・状況」) — both null when the profile does not use the field (no bias, act as before); when set, act in that portrayal/situation after the switch. CR-21: both are also null while the profile's portrayal check state is failed (the specification could not be honored by its source material) — a failed bias is inactive, so act with no bias. CR-22: the output also always carries address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方: use call_user_as at a natural position when set; second-person pronouns only as subject/object when needed, never appended at the end of a sentence; when in doubt, omit) — present for every profile regardless of its call_user_as / second_person settings.",
+      "Creates a pending switch request for a profile (one tap, no confirmation). Returns the request id and the canned phrase to send in chat so the agent applies the switch. The request output also carries the profile's 「私の扱い」 (background.user_relationship, CR-07) as the basis for how to treat the user after the switch, its merged flavor setting (CR-08: level + enabled traits), and video_notes (CR-17: tone findings from the reference videos' dialogue) in listPendingSwitchRequests output. CR-19: the output also carries portrayal_focus + portrayal_focus_note (「演じる姿・状況」) — both null when the profile does not use the field (no bias, act as before); when set, act in that portrayal/situation after the switch. CR-21: both are also null while the profile's portrayal check state is failed (the specification could not be honored by its source material) — a failed bias is inactive, so act with no bias. CR-22: the output also always carries address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方: use call_user_as at a natural position when set; second-person pronouns only as subject/object when needed, never appended at the end of a sentence; when in doubt, omit) — present for every profile regardless of its call_user_as / second_person settings. CR-28: the output also carries reference_image — the generation reference resolved from the target profile's current primary image (uploads carry an openable url; the bare blob_key is an internal storage key) — plus reference_image_note, the no-substitution contract (never use another image found in the profile as the reference; write back failed when the reference cannot be obtained). Both are null when the profile has no image.",
     request: z.object({ profile_id: z.string().min(1) }),
     response: z.object({
       request_id: z.string(),
@@ -4250,7 +4466,7 @@ export const Actions = {
 
   createGenerationRequest: defineAction({
     description:
-      "Queues a request for the chat-side agent: image_generation, link_summary, trial_conversation, profile_apply (CR-03: apply an edit to the active avatar right away; normally created by updateProfile with apply_now=true), or flavor_examples (CR-12: invent example lines for flavor traits whose auto_examples flag is on and whose examples are empty — normally queued automatically by createProfile/updateProfile; when created through this action for a profile, the payload is rebuilt server-side from the profile's current targets and context, and an already-open flavor_examples request for that profile is refreshed instead of duplicated). Payload is a JSON string describing what to generate. For profile_apply the response also carries the canned phrase (CR-04) to paste into chat as the trigger. CR-06: link_summary / trial_conversation payloads are enriched server-side with the profile's merged speech fields (speech / speech_structured), their sources (speech_sources), and manual_speech_fields — infer the non-manual speech fields from the background links/name and return them in the write-back result. CR-07: those payloads also carry user_relationship (「私の扱い」) with a note to follow it in greeting/tone generation when set; it is the user's own specification and must never be changed by a write-back. CR-08: those payloads also carry the flavor setting (flavor: level + enabled traits; flavor_traits: all stored traits; manual_flavor_traits: the protected manual ones) — infer flavor traits from the background links/name and return them in the write-back result as flavor_traits [{label, examples[], scenes[], enabled}]; never change manual traits or the level. video_transcript (CR-17: fetch the transcripts of the profile's 参考動画URL and mine the dialogue for tone — normally queued automatically by createProfile/updateProfile when an unprocessed video URL exists; when created through this action the payload is rebuilt server-side from the profile's current video URLs and context with force, and an already-open video_transcript request is refreshed instead of duplicated). CR-23: a YouTube playlist URL (youtube.com/playlist?list=…) among the video URLs is flagged in the payload as playlist_urls with a playlist_note — the chat side expands the list and fetches the transcript of every video in it, mining the whole list's dialogue together into one video_notes; per-video failures are reported in unreadable_videos as 「{playlist URL} 内の {video URL}（reason）」 so they stay tied to the playlist entry, and the playlist URL itself is marked attempted like any other video URL. CR-17: link_summary / trial_conversation payloads also carry video_notes (background.video_notes — tone findings from the reference videos' dialogue) as tone reference material. CR-19: when the profile's 「演じる姿・状況」 (background.portrayal_focus) is set, payloads additionally carry portrayal_focus + portrayal_focus_note — for link_summary / flavor_examples / video_transcript / image_generation, use ONLY the source material matching that portrayal/situation (for videos, the matching chapters/segments) and report back (portrayal_focus_no_match) instead of filling from other periods/states when nothing matches; for trial_conversation, respond in that portrayal/situation. When portrayal_focus is empty, no portrayal keys are added at all. CR-20: link_summary payloads state the unified speech/flavor merge rules in their notes (speech_note / speech_merge_note / note, flavor_note) — speech write-backs merge like CR-18 video write-backs (catchphrase union, first/second person fill-only, memo/style as integrated text) and flavor write-backs merge into existing auto traits instead of replacing them; video_transcript payloads carry the current flavor (flavor / flavor_traits with auto/manual distinction, manual_flavor_traits, flavor_note) and their results may carry flavor_traits. CR-21: the portrayal notes (portrayal_focus_note) now state the fall-back contract — when no source material matches the specified portrayal/situation, ignore the bias and build the summary/tone from ALL material as usual (never replace the summary or notes with a 'no material' text), and report the miss in the result as portrayal_focus_no_match: true with portrayal_focus_no_match_reason (a reason sentence). While a profile's portrayal check state is failed, its bias is inactive and NO portrayal keys are added to any payload (generation, trial, image) — the payload is exactly the one an unused-field profile gets. CR-22: trial_conversation payloads (acting) are enriched server-side with address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方) — for every profile regardless of its call_user_as / second_person settings, and a profile_apply payload created through this action gains it too; the generation kinds (link_summary / video_transcript / flavor_examples / image_generation) never carry it. CR-24: kind chara_chat_sync reflects one profile into the chara-chat app — normally queued automatically by createProfile/updateProfile when the form's 「キャラチャットに反映する」 checkbox is on; when created through this action the target is re-discovered server-side under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus), the payload is rebuilt with the discovered target slug, an already-open request for the profile is refreshed instead of duplicated, and the mediator is kicked; it errors when no receiver exists in this environment. For link_summary / trial_conversation, an already-open request of the same kind for the profile is likewise refreshed with the new payload instead of duplicated (image_generation / profile_apply always create a fresh request).",
+      "Queues a request for the chat-side agent: image_generation, link_summary, trial_conversation, profile_apply (CR-03: apply an edit to the active avatar right away; normally created by updateProfile with apply_now=true), or flavor_examples (CR-12: invent example lines for flavor traits whose auto_examples flag is on and whose examples are empty — normally queued automatically by createProfile/updateProfile; when created through this action for a profile, the payload is rebuilt server-side from the profile's current targets and context, and an already-open flavor_examples request for that profile is refreshed instead of duplicated). Payload is a JSON string describing what to generate. For profile_apply the response also carries the canned phrase (CR-04) to paste into chat as the trigger. CR-06: link_summary / trial_conversation payloads are enriched server-side with the profile's merged speech fields (speech / speech_structured), their sources (speech_sources), and manual_speech_fields — infer the non-manual speech fields from the background links/name and return them in the write-back result. CR-07: those payloads also carry user_relationship (「私の扱い」) with a note to follow it in greeting/tone generation when set; it is the user's own specification and must never be changed by a write-back. CR-08: those payloads also carry the flavor setting (flavor: level + enabled traits; flavor_traits: all stored traits; manual_flavor_traits: the protected manual ones) — infer flavor traits from the background links/name and return them in the write-back result as flavor_traits [{label, examples[], scenes[], enabled}]; never change manual traits or the level. video_transcript (CR-17: fetch the transcripts of the profile's 参考動画URL and mine the dialogue for tone — normally queued automatically by createProfile/updateProfile when an unprocessed video URL exists; when created through this action the payload is rebuilt server-side from the profile's current video URLs and context with force, and an already-open video_transcript request is refreshed instead of duplicated). CR-23: a YouTube playlist URL (youtube.com/playlist?list=…) among the video URLs is flagged in the payload as playlist_urls with a playlist_note — the chat side expands the list and fetches the transcript of every video in it, mining the whole list's dialogue together into one video_notes; per-video failures are reported in unreadable_videos as 「{playlist URL} 内の {video URL}（reason）」 so they stay tied to the playlist entry, and the playlist URL itself is marked attempted like any other video URL. CR-17: link_summary / trial_conversation payloads also carry video_notes (background.video_notes — tone findings from the reference videos' dialogue) as tone reference material. CR-19: when the profile's 「演じる姿・状況」 (background.portrayal_focus) is set, payloads additionally carry portrayal_focus + portrayal_focus_note — for link_summary / flavor_examples / video_transcript / image_generation, use ONLY the source material matching that portrayal/situation (for videos, the matching chapters/segments) and report back (portrayal_focus_no_match) instead of filling from other periods/states when nothing matches; for trial_conversation, respond in that portrayal/situation. When portrayal_focus is empty, no portrayal keys are added at all. CR-20: link_summary payloads state the unified speech/flavor merge rules in their notes (speech_note / speech_merge_note / note, flavor_note) — speech write-backs merge like CR-18 video write-backs (catchphrase union, first/second person fill-only, memo/style as integrated text) and flavor write-backs merge into existing auto traits instead of replacing them; video_transcript payloads carry the current flavor (flavor / flavor_traits with auto/manual distinction, manual_flavor_traits, flavor_note) and their results may carry flavor_traits. CR-21: the portrayal notes (portrayal_focus_note) now state the fall-back contract — when no source material matches the specified portrayal/situation, ignore the bias and build the summary/tone from ALL material as usual (never replace the summary or notes with a 'no material' text), and report the miss in the result as portrayal_focus_no_match: true with portrayal_focus_no_match_reason (a reason sentence). While a profile's portrayal check state is failed, its bias is inactive and NO portrayal keys are added to any payload (generation, trial, image) — the payload is exactly the one an unused-field profile gets. CR-22: trial_conversation payloads (acting) are enriched server-side with address_note — the standing instruction on how to address the user (呼びかけ・二人称の使い方) — for every profile regardless of its call_user_as / second_person settings, and a profile_apply payload created through this action gains it too; the generation kinds (link_summary / video_transcript / flavor_examples / image_generation) never carry it. CR-24: kind chara_chat_sync reflects one profile into the chara-chat app — normally queued automatically by createProfile/updateProfile when the form's 「キャラチャットに反映する」 checkbox is on; when created through this action the target is re-discovered server-side under the interop contract (primarily an app publishing the getAvatarReceiverInfo self-introduction; fallback an app publishing all of importCharactersBulk / getImportStates / getImportStatus), the payload is rebuilt with the discovered target slug, an already-open request for the profile is refreshed instead of duplicated, and the mediator is kicked; it errors when no receiver exists in this environment. For link_summary / trial_conversation, an already-open request of the same kind for the profile is likewise refreshed with the new payload instead of duplicated (image_generation / profile_apply always create a fresh request). CR-28: profile_apply and image_generation payloads for a profile are enriched server-side with reference_image — the generation reference resolved from the profile's current primary image (uploads carry an openable url alongside the internal blob_key) — and reference_image_note (never substitute another image found in the profile; fail the write-back when the reference cannot be obtained); a profile_apply payload's image_ref is replaced by the resolved reference value when one exists.",
     request: z.object({
       profile_id: z.string().min(1).nullable().default(null),
       kind: z.enum([
@@ -4426,6 +4642,19 @@ export const Actions = {
             args.payload,
           );
           obj.address_note = ADDRESS_NOTE;
+          // CR-28: the same reference resolution as the canonical
+          // updateProfile path — the generation reference comes from
+          // the profile's current primary image (uploads carry an
+          // openable url), and a caller-supplied image_ref that
+          // disagrees with it is replaced by the resolved value.
+          const data = parseData(row.data);
+          const { ref_value, reference } = await buildReferenceImage(
+            ctx,
+            data,
+          );
+          obj.reference_image = reference;
+          obj.reference_image_note = reference ? REFERENCE_IMAGE_NOTE : null;
+          if (ref_value !== null) obj.image_ref = ref_value;
           payload = JSON.stringify(obj);
         }
         // CR-19: image_generation — only when 「演じる姿・状況」 is
@@ -4433,16 +4662,28 @@ export const Actions = {
         // depict that portrayal/situation. When unset the client's
         // payload passes through untouched.
         // CR-21: a failed bias is inactive here too (no keys added).
+        // CR-28: when the profile has a designated base image, the
+        // generation reference (resolved from the current primary
+        // image, uploads as an openable url) travels with the request
+        // under the no-substitution contract.
         if (args.kind === "image_generation") {
           const data = parseData(row.data);
+          const obj: Record<string, unknown> = parsePayloadObject(
+            args.payload,
+          );
+          let touched = false;
+          const { reference } = await buildReferenceImage(ctx, data);
+          if (reference) {
+            obj.reference_image = reference;
+            obj.reference_image_note = REFERENCE_IMAGE_NOTE;
+            touched = true;
+          }
           const pf = portrayalEffectiveValue(data);
           if (pf) {
-            const obj: Record<string, unknown> = parsePayloadObject(
-              args.payload,
-            );
             Object.assign(obj, portrayalFields(data, portrayalImageNote));
-            payload = JSON.stringify(obj);
+            touched = true;
           }
+          if (touched) payload = JSON.stringify(obj);
         }
       }
       const now = new Date();
